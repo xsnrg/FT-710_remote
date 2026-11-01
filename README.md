@@ -11,6 +11,8 @@ It has two halves:
 * **Rig-side services** (`server/`, Python) – run on the Linux machine that is
   USB-connected to the FT-710, next to flrig and a Mumble server (murmur).
 
+![FT-710 Remote client showing the band scope and waterfall on 20 m](docs/screenshot.png)
+
 ## Features
 
 * **Mumble bridge** – `radio_bridge.py` joins your Mumble server as a bot user
