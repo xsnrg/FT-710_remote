@@ -6,6 +6,7 @@
 #include <QLocalSocket>
 #include <QTcpSocket>
 #include <functional>
+#include <memory>
 #include <cmath>
 #include <QDomDocument>
 #include <QtDBus/QDBusInterface>
@@ -266,12 +267,14 @@ static bool mumbleRunning() {
 }
 
 #include "netaudio.h"   // network audio (LAN stream) mode; uses cfg, shq() and sshArgs() above
+#include "txgate.h"     // TX without Mumble (mic -> ft710-txgate on the rig host); uses naCfg
 
 // One ssh round trip per poll. Prints key=value lines, then the log if asked.
 // Settings arrive as shell variables (BRIDGE, MURMUR, TXEN, TXGAIN, FLRIG) prepended by pollScript().
 static const char *POLL_SCRIPT = R"SH(
 if [ -n "$MURMUR" ]; then echo "murmur=$(systemctl is-active "$MURMUR" 2>/dev/null)"; else echo "murmur=not checked"; fi
 echo "bridge=$(systemctl --user is-active "$BRIDGE" 2>/dev/null)"
+[ -n "$TXUNIT" ] && echo "txgate=$(systemctl --user is-active "$TXUNIT" 2>/dev/null)"
 [ -e "$TXEN" ] && echo tx=on || echo tx=off
 INV=$(systemctl --user show -p InvocationID --value "$BRIDGE" 2>/dev/null)
 if [ -n "$INV" ]; then J=$(journalctl --user _SYSTEMD_INVOCATION_ID=$INV --no-pager -o cat 2>/dev/null | tail -n 400); fi
@@ -284,8 +287,9 @@ echo "txgain=$(cat "$TXGAIN" 2>/dev/null || echo none)"
 if [ "$1" = log ]; then echo ---LOG---; journalctl --user -u "$BRIDGE" -n 20 --no-pager 2>/dev/null; fi
 )SH";
 static QByteArray pollScript() {
-    const QString vars = QString("BRIDGE=%1\nMURMUR=%2\nTXEN=%3\nTXGAIN=%4\nFLRIG=%5\n")
-        .arg(shq(cfg.bridgeService), shq(cfg.murmurService), cfg.remoteFile("tx_enabled"), cfg.remoteFile("tx_gain"), shq(cfg.flrigUrl()));
+    const QString vars = QString("BRIDGE=%1\nMURMUR=%2\nTXEN=%3\nTXGAIN=%4\nFLRIG=%5\nTXUNIT=%6\n")
+        .arg(shq(cfg.bridgeService), shq(cfg.murmurService), cfg.remoteFile("tx_enabled"), cfg.remoteFile("tx_gain"), shq(cfg.flrigUrl()),
+             naCfg.enabled() && naCfg.txGate ? shq(naCfg.txUnit) : QString());
     return (vars + POLL_SCRIPT).toUtf8();
 }
 
@@ -571,6 +575,29 @@ public:
         netStartBtn->setToolTip("Start/stop the network audio stream (also started by Connect and stopped by Disconnect).");
         nr->addWidget(netName); nr->addWidget(netLevel); nr->addWidget(netVol, 1); nr->addWidget(netVolLbl); nr->addWidget(netMuteBtn); nr->addWidget(netStartBtn);
         v->addWidget(netRow);
+        // Direct TX (network mode, no Mumble): mic level of what PTT would send to the TX gate.
+        micRow = new QWidget; auto *mr = new QHBoxLayout(micRow); mr->setContentsMargins(0, 0, 0, 0);
+        auto *micName = new QLabel("TX mic:");
+        micBar = new QProgressBar; micBar->setRange(0, 60); micBar->setValue(0); micBar->setTextVisible(true); micBar->setFormat("—");
+        micBar->setToolTip("Level of the microphone the app sends to the TX gate while PTT is held (dBFS). "
+                           "Aim for peaks around -12 to -6 dBFS; set the mic level in your desktop sound settings "
+                           "and the level into the radio with \"TX level\".");
+        micDev = new QLabel; micDev->setStyleSheet("color:gray;");
+        mr->addWidget(micName); mr->addWidget(micBar, 1); mr->addWidget(micDev);
+        v->addWidget(micRow);
+        { QLabel *a = qobject_cast<QLabel *>(nr->itemAt(0)->widget()); int w = qMax(a->sizeHint().width(), micName->sizeHint().width());
+          a->setMinimumWidth(w); micName->setMinimumWidth(w); }
+        tx = new TxLink(this);
+        tx->changed = [this] { updateTxUi(); };
+        tx->logLine = [](const QString &m) { QTextStream(stderr) << "txgate: " << m << Qt::endl; };
+        tx->pttLost = [this](const QString &why) {
+            if (!talking || !talkNet) return;
+            talking = false; talkNet = false; tx->setPtt(false);
+            resetPttButton(); note("PTT dropped: " + why);
+            fastPollSince.start(); adjustPollRate();
+        };
+        micUi.setInterval(100);
+        connect(&micUi, &QTimer::timeout, this, [this] { updateMicUi(); });
         auto syncMute = [this](bool on) { netMuteBtn->setText(on ? "Listen: off" : "Listen: on"); netMuteBtn->setStyleSheet(on ? "" : "background:#2a2; color:white;"); };
         syncMute(naCfg.listenMute);
         connect(netMuteBtn, &QToolButton::toggled, this, [this, syncMute](bool on) { syncMute(on); na->setListen(netVol->value(), on); });
@@ -676,6 +703,8 @@ public:
         g->addRow("VFO:", vfoLbl);
         netLbl = new QLabel("…"); netLbl->setWordWrap(true);
         g->addRow("Network audio:", netLbl);
+        txgLbl = new QLabel("…"); txgLbl->setWordWrap(true);
+        g->addRow("TX gate (direct TX):", txgLbl);
         statusForm = g;
         v->addWidget(box);
 
@@ -741,6 +770,7 @@ public:
         qApp->installEventFilter(this);
         connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
             stopTalk(true);
+            if (tx->active()) tx->stop(naCfg.restoreBridge, naCfg.restoreBridge, true);   // gate unkeys; bridge back if configured
             if (na->active() && !naCfg.keepOnExit) na->stop(true);   // leave nothing streaming behind
         });
 
@@ -968,7 +998,7 @@ private:
     static int gainToPct(double g) { return int(std::lround(std::cbrt(qMax(0.0, g)) * 100.0)); }
     void setTxEnabled(bool on) {
         txSlider->setEnabled(on); txResetBtn->setEnabled(on);
-        const QString tip = on ? "Level of the Mumble audio the bridge on the rig host plays into the FT-710's USB input. "
+        const QString tip = on ? "Level of the TX audio (Mumble via radio-bridge, or your mic via the TX gate) played into the FT-710's USB input. "
                                  "Lower it if you're driving the radio too hard; 100% = unchanged. Saved on the rig host "
                                  "(~/.config/radio-bridge/tx_gain), so it survives bridge restarts. "
                                  "Does not key the radio or change tx_enabled."
@@ -1018,6 +1048,42 @@ private:
     // --- network audio ---
     NetAudio *na; QWidget *netRow; QProgressBar *netLevel; QSlider *netVol; QLabel *netVolLbl, *netLbl;
     QToolButton *netMuteBtn; QPushButton *netStartBtn; QFormLayout *statusForm = nullptr; QTimer netVolApply;
+    // --- direct TX (TX gate) ---
+    TxLink *tx; QWidget *micRow; QProgressBar *micBar; QLabel *micDev, *txgLbl; QTimer micUi;
+    bool talkNet = false;          // the current over goes through the TX gate (not Mumble)
+    QString gateSvc;               // last polled state of the gate unit
+    QString noteText; QElapsedTimer noteAge;
+    void note(const QString &t) { noteText = t; noteAge.start(); mumbleLbl->setText(t); }
+    void updateMicUi() {
+        if (!tx->active()) { micBar->setValue(0); micBar->setFormat("—"); return; }
+        const double db = tx->micDb();
+        if (tx->micUp() && db > -119) {
+            micBar->setValue(int(qBound(0.0, db + 60, 60.0)));
+            micBar->setFormat(QString("%1 dBFS").arg(db, 0, 'f', 0));
+            micBar->setStyleSheet(QString("QProgressBar::chunk { background:%1; }").arg(db > -3 ? "#c00" : talking && talkNet ? "#c60" : "#2a2"));
+        } else { micBar->setValue(0); micBar->setFormat("no mic signal"); micBar->setStyleSheet(""); }
+    }
+    void updateTxUi() {
+        const bool on = naCfg.txNet();
+        micRow->setVisible(on);
+        if (statusForm) statusForm->setRowVisible(txgLbl, on);
+        micDev->setText(naCfg.micSource.isEmpty() ? "default input" : naCfg.micSource);
+        if (tx->active()) micUi.start(); else { micUi.stop(); updateMicUi(); }
+        if (!on && !tx->active()) { updateUi(); return; }
+        if (tx->active()) colored(txgLbl, tx->statusText(), tx->gateKeyed() ? "#c00" : tx->ready() ? "green" : "#c60");
+        else colored(txgLbl, "not connected (Connect starts it)" + (gateSvc.isEmpty() ? QString() : " · service " + gateSvc), "gray");
+        if (tx->ready()) showPtt(tx->rigPtt());
+        if (talking && talkNet) {
+            ptt->setText(tx->gateKeyed() ? "TALKING" : "TALKING?\n(" + (tx->lastEvent().isEmpty() ? QString("gate not keyed yet") : tx->lastEvent()) + ")");
+        }
+        updateUi();
+    }
+    void showPtt(const QString &p) {
+        radioRx = (p == "0");
+        if (p.isEmpty() || p == "?") colored(pttLbl, "flrig not answering", "gray");
+        else if (p == "1") { pttLbl->setText("  TX  "); pttLbl->setStyleSheet("color:white; background:#c00;"); }
+        else colored(pttLbl, "RX", "green");
+    }
     void updateNetUi() {
         const bool on = naCfg.enabled();
         netRow->setVisible(on);
@@ -1126,7 +1192,10 @@ private:
     // Press: arm the debounce timer; a release within PTT_MIN_HOLD_MS cancels without keying.
     void pressPtt() {
         if (talking || holdTimer.isActive()) return;
-        if (!mumbleRunning()) { ptt->setDown(false); mumbleLbl->setText("Mumble not running — Connect first"); return; }
+        if (naCfg.txNet()) {   // direct TX through the TX gate
+            if (!tx->ready()) { ptt->setDown(false); note("TX link not ready — " + (tx->active() ? tx->statusText() : QString("Connect first"))); return; }
+            if (txState != "on") { ptt->setDown(false); note("TX keying is disabled (Enable TX keying first)"); return; }
+        } else if (!mumbleRunning()) { ptt->setDown(false); mumbleLbl->setText("Mumble not running — Connect first"); return; }
         ptt->setStyleSheet("background:#e90; color:black;");
         ptt->setText("hold…");
         holdTimer.start();
@@ -1135,6 +1204,14 @@ private:
     void beginTalk() {
         holdTimer.stop();
         if (talking) return;
+        if (naCfg.txNet()) {
+            if (!tx->setPtt(true)) { resetPttButton(); note("TX link not ready — not keyed"); return; }
+            talking = true; talkNet = true;
+            ptt->setStyleSheet("background:#c00; color:white;");
+            ptt->setText("TALKING?\n(waiting for the gate)");
+            updateTxUi(); adjustPollRate(); poll();
+            return;
+        }
         if (!mumbleRunning()) { resetPttButton(); mumbleLbl->setText("Mumble not running — Connect first"); return; }
         if (stopRetry.isActive()) {   // an earlier stop is still unacknowledged: try once more, then stop retrying
             stopRetry.stop(); stopTries = 0;
@@ -1151,7 +1228,11 @@ private:
     }
     void stopTalk(bool force = false) {
         if (holdTimer.isActive()) { holdTimer.stop(); resetPttButton(); return; }   // short tap: never keyed
-        if (talking) {
+        if (talking && talkNet) {   // direct TX: the gate drains, hangs and unkeys (and unkeys by itself if this is lost)
+            talking = false; talkNet = false;
+            tx->setPtt(false);
+            fastPollSince.start(); adjustPollRate();
+        } else if (talking) {
             talking = false;
             fastPollSince.start();
             if (mumbleRpc("self", {{"stoptalking", "stoptalking"}})) updatePttWarn(false);
@@ -1234,9 +1315,15 @@ public:
     //    The password comes from the rig host (bridge's server.pw, over ssh) or the local settings,
     //    per Settings > Mumble > Password; it never appears on a command line.
     void doConnect() {
-        // Network audio mode: start the LAN stream too. PTT/TX still go through Mumble + radio-bridge.
+        // Network audio mode: start the LAN stream. With direct TX (default in network mode) PTT and
+        // the mic go to the TX gate and Mumble is not used at all; otherwise PTT/TX still use Mumble.
         if (naCfg.enabled() && cfg.configured()) {
             if (!na->active()) na->start();
+            if (naCfg.txGate) {
+                if (!tx->active()) tx->start();
+                note("Network mode: RX " + naCfg.modeName() + ", TX direct via the TX gate (Mumble not used)");
+                updateTxUi(); return;
+            }
             if (cfg.mumbleUser.isEmpty()) { mumbleLbl->setText("Network audio started (no Mumble user set: no PTT)"); return; }
         }
         if (!cfg.configured() || cfg.mumbleUser.isEmpty()) {
@@ -1297,6 +1384,39 @@ public:
     // Hidden test hook (--minimize-test <pid>): run the start-minimized watcher on an existing process.
     void minimizeTest(qint64 pid) { minimizeMumbleWhenShown(pid); }
     void raiseTest() { raiseMumble(); }
+    // Hidden test hook (--txgate-gui-test HOST PORT TOKENFILE HOLD_MS): the real PTT button path
+    // against a test gate (direct connection, 700 Hz test tone, settings not saved). Prints each step.
+    void txGuiTest(const QString &host, quint16 port, const QByteArray &tok, int holdMs) {
+        naCfg.mode = 2; naCfg.txGate = true;          // in memory only
+        auto out = [this](const QString &m) {
+            QTextStream(stdout) << "gui-test: " << m << " | button=" << ptt->text().replace('\n', ' ') << " enabled=" << ptt->isEnabled()
+                                << " talking=" << talking << " | gate: " << txgLbl->text() << " | rigPtt: " << pttLbl->text().trimmed() << Qt::endl; };
+        tx->startDirect(host, port, tok, true);
+        updateTxUi();
+        auto *wait = new QTimer(this); wait->setInterval(50);
+        auto t0 = std::make_shared<QElapsedTimer>(); t0->start();
+        connect(wait, &QTimer::timeout, this, [=, this] {
+            if (!tx->ready() && t0->elapsed() < 10000) return;
+            wait->stop(); wait->deleteLater();
+            out("ready");
+            txState = "on";                            // the test gate decides; the real tx_enabled is not touched
+            pressPtt(); out("pressed");
+            QTimer::singleShot(holdMs / 2, this, [=, this] { out("holding"); });
+            QTimer::singleShot(holdMs, this, [=, this] {
+                stopTalk(); out("released");
+                QTimer::singleShot(1500, this, [=, this] {
+                    out("after hang");
+                    txState = "on"; pressPtt(); QTimer::singleShot(600, this, [=, this] {
+                        out("second over held");
+                        QEvent fo(QEvent::ActivationChange); changeEvent(&fo);   // focus loss must release
+                        out("focus lost");
+                        QTimer::singleShot(1500, qApp, [] { qApp->quit(); });
+                    });
+                });
+            });
+        });
+        wait->start();
+    }
     void pttTest(int ms) {
         QTextStream err(stderr);
         err << "ptt-test: connected=" << isConnectedToServer() << "\n"; err.flush();
@@ -1316,7 +1436,12 @@ private:
     void doDisconnect() {
         stopTalk(true);
         if (na->active()) na->stop(true);   // stop both network-audio units cleanly
-        if (!mumbleRunning()) { mumbleLbl->setText("Mumble is not running"); return; }
+        if (tx->active()) {   // gate unkeys on stop; radio-bridge comes back only if configured (and PTT=0, no marker)
+            tx->stop(naCfg.restoreBridge, naCfg.restoreBridge, false);
+            note(naCfg.restoreBridge ? "Disconnected: TX gate stopping, radio-bridge being restored" : "Disconnected (TX gate left running, radio-bridge stays stopped)");
+            updateTxUi();
+        }
+        if (!mumbleRunning()) { if (!naCfg.txNet()) mumbleLbl->setText("Mumble is not running"); return; }
         QMessageBox mb(QMessageBox::Question, "Disconnect",
             "Stopped talking. Close Mumble now?\n\nThis disconnects from the server and quits Mumble "
             "normally (as its own Quit does), so it keeps its settings. Mumble may ask to confirm.",
@@ -1350,7 +1475,8 @@ private:
         stopTalk();
         bool enable = txState != "on";
         if (enable && QMessageBox::question(this, "TX keying",
-                "Enable TX keying? Anyone talking on the Mumble server will key the FT-710.") != QMessageBox::Yes)
+                naCfg.txNet() ? "Enable TX keying? The PTT button / Space in this app will key the FT-710 through the TX gate."
+                              : "Enable TX keying? Anyone talking on the Mumble server will key the FT-710.") != QMessageBox::Yes)
             return;
         bool ok;
         sshRun((enable ? "touch " : "rm -f ") + cfg.remoteFile("tx_enabled"), &ok);
@@ -1370,7 +1496,7 @@ private:
             scope->stop();
             if (cfg.configured() || !cfg.scopeHost.isEmpty()) scope->start(cfg.effScopeHost(), quint16(cfg.scopePort));
         }
-        poll(); pollVolume(); updateUi(); updateNetUi();
+        poll(); pollVolume(); updateUi(); updateNetUi(); updateTxUi();
     }
     void editSettings() {
         stopTalk();
@@ -1433,7 +1559,7 @@ private:
         naMode->setCurrentIndex(naCfg.mode);
         naMode->setToolTip("Mumble: radio audio comes through Mumble only. LAN stream: the rig host also sends the radio's "
                            "receive audio straight to this computer with PipeWire, as the capture device \"FT-710 RX (network)\" "
-                           "for WSJT-X, fldigi etc. Receive only; PTT/TX still use Mumble and radio-bridge.");
+                           "for WSJT-X, fldigi etc. PTT/TX: see \"PTT / TX audio\" below.");
         auto *naComp = new QComboBox; naComp->addItems({"None (L16, LAN)", "Opus 24 kbit/s", "Opus 32 kbit/s", "Opus 48 kbit/s", "Opus 64 kbit/s"});
         static const int kb[] = {24, 32, 48, 64};
         naComp->setCurrentIndex(naCfg.compression == 1 ? 1 + int(std::find(kb, kb + 4, naCfg.opusKbps) - kb) % 4 : 0);
@@ -1459,12 +1585,46 @@ private:
         auto *naNote = new QLabel("Needs PipeWire with pipewire-module-roc (ROC) on both computers; Opus needs GStreamer "
                                   "(pipewire-gstreamer, opus plugins) on the rig host. Pick \"FT-710 RX (network)\" as the input in WSJT-X/fldigi.");
         naNote->setWordWrap(true); f5->addRow(naNote);
-        auto syncNa = [naMode, naComp, naPkt, naFec, naPort, naLat, naSrc, naDest] {
+        // Direct TX (no Mumble)
+        auto *txPath = new QComboBox; txPath->addItems({"Direct to the TX gate (no Mumble)", "Mumble + radio-bridge"});
+        txPath->setCurrentIndex(naCfg.txGate ? 0 : 1);
+        txPath->setToolTip("Direct: PTT/Space and this computer's microphone go straight to the ft710-txgate service on the rig "
+                           "host, which keys flrig only while you hold PTT (radio-bridge is stopped while it runs). "
+                           "Mumble: the previous behaviour.");
+        auto *txMic = new QComboBox; txMic->setEditable(true); txMic->addItem("", QString());
+        txMic->setItemText(0, "(default input)");
+        {
+            QProcess pc; pc.start("pactl", {"-f", "json", "list", "sources"}); pc.waitForFinished(3000);
+            for (const QJsonValue &v : QJsonDocument::fromJson(pc.readAllStandardOutput()).array()) {
+                const QJsonObject o = v.toObject(); const QString name = o["name"].toString();
+                if (name.isEmpty() || name.endsWith(".monitor") || name.startsWith("ft710_")) continue;
+                txMic->addItem(o["description"].toString().isEmpty() ? name : o["description"].toString() + "  [" + name + "]", name);
+            }
+        }
+        if (!naCfg.micSource.isEmpty()) {
+            int k = txMic->findData(naCfg.micSource);
+            if (k < 0) { txMic->addItem(naCfg.micSource, naCfg.micSource); k = txMic->count() - 1; }
+            txMic->setCurrentIndex(k);
+        }
+        txMic->setToolTip("Microphone (PipeWire source) sent to the radio. Default input follows your desktop setting.");
+        auto *txPort = new QSpinBox; txPort->setRange(1024, 65535); txPort->setValue(naCfg.txPort);
+        txPort->setToolTip("TCP (control) and UDP (audio) port of ft710-txgate on the rig host (TG_PORT there).");
+        auto *txUnit = mk(naCfg.txUnit, "ft710-txgate", "systemd --user unit of the TX gate on the rig host.");
+        auto *txRestore = new QCheckBox("Restore radio-bridge (Mumble path) on Disconnect"); txRestore->setChecked(naCfg.restoreBridge);
+        txRestore->setToolTip("On Disconnect/close: stop the TX gate and start radio-bridge again (only if the radio is not "
+                              "transmitting). Switching the audio mode back to Mumble always restores it.");
+        f5->addRow("PTT / TX audio:", txPath); f5->addRow("Microphone:", txMic); f5->addRow("TX gate port:", txPort);
+        f5->addRow("TX gate service:", txUnit); f5->addRow("", txRestore);
+        auto syncNa = [naMode, naComp, naPkt, naFec, naPort, naLat, naSrc, naDest, txPath, txMic, txPort, txUnit, txRestore] {
             const int m = naMode->currentIndex(); const bool on = m != 0;
             if (m == 1) naComp->setCurrentIndex(0);
             naComp->setEnabled(m == 2); naPkt->setEnabled(m == 2); naFec->setEnabled(m == 1);
             for (QWidget *w : {static_cast<QWidget *>(naPort), static_cast<QWidget *>(naLat), static_cast<QWidget *>(naSrc), static_cast<QWidget *>(naDest)}) w->setEnabled(on);
+            txPath->setEnabled(on);
+            const bool g = on && txPath->currentIndex() == 0;
+            for (QWidget *w : {static_cast<QWidget *>(txMic), static_cast<QWidget *>(txPort), static_cast<QWidget *>(txUnit), static_cast<QWidget *>(txRestore)}) w->setEnabled(g);
         };
+        connect(txPath, &QComboBox::currentIndexChanged, &d, syncNa);
         connect(naMode, &QComboBox::currentIndexChanged, &d, syncNa);
         connect(naComp, &QComboBox::currentIndexChanged, &d, [naComp, naPkt] {
             const int ms = naPkt->currentData().toInt();
@@ -1502,6 +1662,10 @@ private:
             nn.port = naPort->value(); nn.latencyMs = naLat->value(); nn.packetMs = naPkt->currentData().toInt();
             nn.fec = naFec->currentText(); nn.sourceNode = naSrc->text().trimmed(); nn.destAddr = naDest->text().trimmed();
             nn.keepOnExit = naKeep->isChecked();
+            nn.txGate = txPath->currentIndex() == 0;
+            nn.micSource = txMic->currentIndex() >= 0 && txMic->currentText() == txMic->itemText(txMic->currentIndex())
+                               ? txMic->currentData().toString() : txMic->currentText().trimmed();
+            nn.txPort = txPort->value(); nn.txUnit = txUnit->text().trimmed(); nn.restoreBridge = txRestore->isChecked();
             QString err = n.validate();
             if (err.isEmpty()) err = nn.validate();
             if (!err.isEmpty()) { QMessageBox::warning(&d, "Settings", err); return; }
@@ -1511,8 +1675,21 @@ private:
         if (d.exec() != QDialog::Accepted) return;
         const bool naWasActive = na->active();
         const QString naBefore = naCfg.describe() + naCfg.sourceNode + naCfg.destAddr + QString::number(naCfg.port);
+        const QString txBefore = cfg.sshHost + "|" + cfg.bridgeService + "|" + cfg.flrigUrl() + "|" + naCfg.micSource + "|" + naCfg.txUnit + "|"
+                                 + QString::number(naCfg.txPort) + "|" + naCfg.describe();
+        const bool txWasActive = tx->active();
+        if (txWasActive && !nn.txNet()) {   // leaving direct TX: release, stop the gate, always bring radio-bridge back
+            stopTalk(true);
+            tx->stop(true, true, false);
+            note("Direct TX off: TX gate stopping, radio-bridge being restored");
+        }
         cfg = n; cfg.save();
         naCfg = nn; naCfg.save();
+        if (txWasActive && naCfg.txNet()) {
+            const QString txAfter = cfg.sshHost + "|" + cfg.bridgeService + "|" + cfg.flrigUrl() + "|" + naCfg.micSource + "|" + naCfg.txUnit + "|"
+                                    + QString::number(naCfg.txPort) + "|" + naCfg.describe();
+            if (txAfter != txBefore) { stopTalk(true); tx->stop(false, false, false); tx->start(); }
+        }
         // Network audio: stop it when switched back to Mumble, restart it when its settings changed.
         if (naWasActive && !naCfg.enabled()) na->stop(false);
         else if (naWasActive && naBefore != naCfg.describe() + naCfg.sourceNode + naCfg.destAddr + QString::number(naCfg.port)) na->start();
@@ -1538,7 +1715,11 @@ private:
               "**Network audio** (Settings > Network audio): instead of only hearing the radio through Mumble, the rig host can "
               "stream its receive audio straight to this computer (ROC or RTP, optional Opus) as the input device "
               "\"FT-710 RX (network)\" for WSJT-X/fldigi; Connect starts it, Disconnect stops it, and it restarts itself if the "
-              "link drops. Receive only: PTT and TX audio still go through Mumble. "
+              "link drops. **Direct TX** (network mode, \"PTT / TX audio\" = TX gate, the default there): PTT/Space send this computer's "
+              "microphone straight to the ft710-txgate service on the rig host, which keys the radio through flrig only while "
+              "you hold PTT (key, ~70 ms, then audio; 0.7 s hang after release; 120 s timeout) and unkeys by itself if the link, "
+              "heartbeat or audio stops. Mumble is not used; radio-bridge is stopped while the gate runs and restored on "
+              "Disconnect (if enabled) or when you switch back to Mumble. \"TX level\" is applied by the gate. "
               "**Settings…** holds the rig host, flrig, Mumble server and scope addresses.";
         QDialog d(this); d.setWindowTitle("Help / About"); d.resize(640, 520);
         auto *l = new QVBoxLayout(&d); auto *tb = new QTextBrowser; tb->setMarkdown(md); l->addWidget(tb);
@@ -1550,6 +1731,7 @@ private:
     void poll() {
         if (pollProc) return;   // previous poll still running
         if (!cfg.configured()) { setOffline(); return; }
+        if (naCfg.txNet()) updateTxUi();
         pollProc = new QProcess(this);
         QStringList args = sshArgs(log->isVisible() ? "bash -s log" : "bash -s");
         connect(pollProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
@@ -1588,6 +1770,9 @@ private:
         auto act = [](QLabel *l, const QString &s) { colored(l, s.isEmpty() ? "?" : s, s == "active" ? "green" : s == "not checked" ? "gray" : "#c00"); };
         act(murmurLbl, kv["murmur"]);
         act(bridgeLbl, kv["bridge"]);
+        gateSvc = kv.value("txgate");
+        if (naCfg.txNet() && kv["bridge"] != "active" && (gateSvc == "active" || tx->active()))
+            colored(bridgeLbl, kv["bridge"] + " (stopped for direct TX)", "gray");
 
         const QString c = kv["conn"];
         bool connected = c.contains("Mumble connected") || c.contains("status connected=True");
@@ -1600,14 +1785,10 @@ private:
         rxLbl->setText(m.hasMatch() ? m.captured(1) + " (as of last 60 s status line)" : "no status line yet");
 
         txState = kv["tx"];
-        if (txState == "on") colored(txEnLbl, "ENABLED — Mumble audio keys the radio", "#c00");
+        if (txState == "on") colored(txEnLbl, naCfg.txNet() ? "ENABLED — PTT here keys the radio (TX gate)" : "ENABLED — Mumble audio keys the radio", "#c00");
         else colored(txEnLbl, "disabled (receive-only)", "green");
 
-        const QString p = kv["ptt"].trimmed();
-        radioRx = (p == "0");
-        if (p.isEmpty()) colored(pttLbl, "flrig not answering", "gray");
-        else if (p == "1") { pttLbl->setText("  TX  "); pttLbl->setStyleSheet("color:white; background:#c00;"); }
-        else colored(pttLbl, "RX", "green");
+        if (!tx->ready()) showPtt(kv["ptt"].trimmed());   // with the gate link up, its 0.25 s flrig readout is used instead
 
         bool okv; double hz = kv["vfo"].trimmed().toDouble(&okv);
         parseTx(kv["txgain"]);
@@ -1618,10 +1799,20 @@ private:
     }
     void updateUi() {
         bool running = mumbleRunning();
+        if (naCfg.txNet()) {   // Mumble is not part of this mode
+            if (!(noteAge.isValid() && noteAge.elapsed() < 8000))
+                mumbleLbl->setText(tx->active() ? "Direct TX: " + tx->statusText() : "Network mode (direct TX) — Connect to start");
+            disconnectBtn->setEnabled(tx->active() || na->active() || running);
+            ptt->setEnabled(tx->ready() || talking);
+            restartBtn->setEnabled(!tx->active());
+            restartBtn->setToolTip(tx->active() ? "Disabled while the TX gate is in use (radio-bridge would stop it)." : "");
+        } else {
         if ((!mumbleLbl->text().startsWith("Connect request") && !mumbleLbl->text().startsWith("WARNING")) || !running)
             mumbleLbl->setText(running ? "Mumble running" : "Mumble not running");
         disconnectBtn->setEnabled(running);
         ptt->setEnabled(running || talking);
+        restartBtn->setEnabled(true); restartBtn->setToolTip("");
+        }
         txBtn->setEnabled(txState == "on" || txState == "off");
         txBtn->setText(txState == "on" ? "Disable TX keying (go receive-only)"
                      : txState == "off" ? "Enable TX keying" : "TX keying: unknown");
@@ -1694,10 +1885,49 @@ static int netaudioCli(QApplication &app, const QStringList &args, int i) {
     return rc;
 }
 
+// Hidden test hook: --txgate-test HOST PORT TOKENFILE HOLD_MS [--opus KBPS] [--mic] [--wait-ms N]
+// Connects straight to a TX gate (no ssh, nothing started), holds PTT for HOLD_MS with a 700 Hz
+// -20 dBFS test tone (or the configured mic with --mic), releases, prints what the gate reports.
+// Only ever point this at a test gate (fake flrig + null sink): it keys whatever flrig the gate uses.
+static int txgateCli(QApplication &app, const QStringList &args, int i) {
+    QTextStream out(stdout);
+    if (i + 4 >= args.size()) { out << "usage: --txgate-test HOST PORT TOKENFILE HOLD_MS [--opus KBPS] [--mic]" << Qt::endl; return 2; }
+    const QString host = args[i + 1]; const quint16 port = quint16(args[i + 2].toUInt()); const int holdMs = args[i + 4].toInt();
+    QFile tf(args[i + 3]);
+    if (!tf.open(QIODevice::ReadOnly)) { out << "txgate-test: cannot read token file" << Qt::endl; return 2; }
+    const QByteArray tok = tf.readAll().trimmed();
+    naCfg.mode = 2; naCfg.compression = 0;
+    if (int j = args.indexOf("--opus"); j >= 0 && j + 1 < args.size()) { naCfg.compression = 1; naCfg.opusKbps = args[j + 1].toInt(); }
+    const int waitMs = args.indexOf("--wait-ms") >= 0 ? args[args.indexOf("--wait-ms") + 1].toInt() : 2500;
+    TxLink tx;
+    QElapsedTimer t; t.start();
+    auto ts = [&] { return QString("%1").arg(t.elapsed() / 1000.0, 7, 'f', 3); };
+    tx.logLine = [&](const QString &m) { out << ts() << " log " << m << Qt::endl; };
+    QString lastStatus;
+    tx.changed = [&] { const QString s = tx.statusText(); if (s != lastStatus) { lastStatus = s; out << ts() << " status " << s << Qt::endl; } };
+    tx.pttLost = [&](const QString &w) { out << ts() << " pttLost " << w << Qt::endl; };
+    tx.startDirect(host, port, tok, !args.contains("--mic"));
+    enum { Wait, Held, Released } ph = Wait; qint64 relAt = 0; int rc = 1;
+    QTimer tick; tick.setInterval(20);
+    QObject::connect(&tick, &QTimer::timeout, &app, [&] {
+        if (ph == Wait && tx.ready()) { ph = Held; out << ts() << " PTT down (" << tx.codec() << ")" << Qt::endl; tx.setPtt(true); }
+        if (ph == Held && !tx.pttHeld() && relAt == 0) { relAt = t.elapsed(); ph = Released; out << ts() << " PTT dropped by the link" << Qt::endl; }
+        static qint64 downAt = -1; if (ph == Held && downAt < 0) downAt = t.elapsed();
+        if (ph == Held && downAt >= 0 && t.elapsed() - downAt >= holdMs) { tx.setPtt(false); ph = Released; relAt = t.elapsed(); out << ts() << " PTT up" << Qt::endl; }
+        if (ph == Released && t.elapsed() - relAt > waitMs) { rc = 0; app.exit(0); }
+        if (ph == Wait && t.elapsed() > 15000) { out << ts() << " never ready" << Qt::endl; app.exit(1); }
+    });
+    tick.start();
+    app.exec();
+    out << ts() << " final " << tx.statusText() << Qt::endl;
+    tx.stop(false, false, true);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     {   // command-line-only modes work without a display
         bool cli = false;
-        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio")) cli = true;
+        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio") || !strcmp(argv[k], "--txgate-test")) cli = true;
         if (cli && qEnvironmentVariableIsEmpty("DISPLAY") && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) qputenv("QT_QPA_PLATFORM", "offscreen");
     }
     QApplication app(argc, argv);
@@ -1723,11 +1953,14 @@ int main(int argc, char **argv) {
           << "\nnetaudio=" << naCfg.describe() << " port=" << naCfg.port << " source=" << (naCfg.sourceNode.isEmpty() ? "RB_SOURCE" : naCfg.sourceNode)
           << " dest=" << (naCfg.destAddr.isEmpty() ? "auto" : naCfg.destAddr) << " keepOnExit=" << naCfg.keepOnExit
           << " listen=" << (naCfg.listenMute ? "muted" : QString::number(naCfg.listenVol) + "%")
+          << "\ntx=" << (naCfg.txNet() ? "tx-gate" : "mumble") << " gatePort=" << naCfg.txPort << " unit=" << naCfg.txUnit
+          << " mic=" << (naCfg.micSource.isEmpty() ? "default" : naCfg.micSource) << " restoreBridge=" << naCfg.restoreBridge
           << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate())
           << (naCfg.validate().isEmpty() ? "" : " netaudio: " + naCfg.validate()) << Qt::endl;
         return 0;
     }
     if (int i = app.arguments().indexOf("--netaudio"); i >= 0) return netaudioCli(app, app.arguments(), i);
+    if (int i = app.arguments().indexOf("--txgate-test"); i >= 0) return txgateCli(app, app.arguments(), i);
     Main w;
     if (!w.restoreSavedGeometry())
         w.resize(QSettings().value("showScope", true).toBool() ? QSize(760, 880) : QSize(520, 560));
@@ -1752,6 +1985,11 @@ int main(int argc, char **argv) {
     }
     if (int i = args.indexOf("--minimize-test"); i >= 0 && i + 1 < args.size())   // hidden test hook
         QTimer::singleShot(200, &w, [&w, pid = args[i + 1].toLongLong()] { w.minimizeTest(pid); });
+    if (int i = args.indexOf("--txgate-gui-test"); i >= 0 && i + 4 < args.size()) {   // hidden test hook (test gate only)
+        QFile tf(args[i + 3]); if (!tf.open(QIODevice::ReadOnly)) qWarning("cannot read the token file");
+        QTimer::singleShot(300, &w, [&w, h = args[i + 1], p = quint16(args[i + 2].toUInt()), t = tf.readAll().trimmed(), ms = args[i + 4].toInt()] {
+            w.txGuiTest(h, p, t, ms); });
+    }
     if (args.contains("--raise-test"))   // hidden test hook
         QTimer::singleShot(200, &w, [&w] { w.raiseTest(); });
     if (qEnvironmentVariableIsSet("FT710_SMOKE_MS"))   // headless smoke test: auto-quit

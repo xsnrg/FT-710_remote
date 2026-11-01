@@ -1,0 +1,22 @@
+# systemd --user unit for the FT-710 TX gate (direct TX from FT-710 Remote, no Mumble).
+# Install (rig host):
+#   mkdir -p ~/ft710-txgate && cp server/ft710-txgate/ft710_txgate.py ~/ft710-txgate/
+#   cp systemd/ft710-txgate.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   mkdir -p ~/.config/ft710-txgate && cp server/ft710-txgate/txgate.env.example ~/.config/ft710-txgate/txgate.env
+# Do NOT enable it: FT-710 Remote starts it on Connect (network mode) and stops it again.
+# It conflicts with radio-bridge (only one of them may play into the radio's USB input).
+[Unit]
+Description=FT-710 TX gate: PTT + mic audio from FT-710 Remote to flrig/FT-710 (FT-710_remote)
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+Conflicts=radio-bridge.service
+
+[Service]
+# RB_SINK, RB_FLRIG_URL, RB_HANG_S, ... are shared with radio-bridge; TG_* settings override.
+EnvironmentFile=-%h/.config/radio-bridge/bridge.env
+EnvironmentFile=-%h/.config/ft710-txgate/txgate.env
+ExecStart=/usr/bin/python3 -u %h/ft710-txgate/ft710_txgate.py
+# Safety net: if the gate died hard while it had keyed the rig, unkey it (only if its own marker exists).
+ExecStopPost=/usr/bin/python3 %h/ft710-txgate/ft710_txgate.py --unkey-if-marked
+Restart=on-failure
+RestartSec=2
