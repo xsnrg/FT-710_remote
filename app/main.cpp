@@ -265,6 +265,8 @@ static bool mumbleRunning() {
     return s.waitForConnected(300);
 }
 
+#include "netaudio.h"   // network audio (LAN stream) mode; uses cfg, shq() and sshArgs() above
+
 // One ssh round trip per poll. Prints key=value lines, then the log if asked.
 // Settings arrive as shell variables (BRIDGE, MURMUR, TXEN, TXGAIN, FLRIG) prepended by pollScript().
 static const char *POLL_SCRIPT = R"SH(
@@ -548,6 +550,36 @@ public:
           int w = qMax(a->sizeHint().width(), b->sizeHint().width()); a->setMinimumWidth(w); b->setMinimumWidth(w);
           int bw = qMax(muteBtn->sizeHint().width(), txResetBtn->sizeHint().width()); muteBtn->setMinimumWidth(bw); txResetBtn->setMinimumWidth(bw); }
         setTxEnabled(false);
+
+        // Network audio (Settings > Network audio, ROC/RTP mode): RX level of the "FT-710 RX (network)"
+        // device, a local listen monitor (volume/mute; never changes what WSJT-X etc. record) and Start/Stop.
+        na = new NetAudio(this);
+        netRow = new QWidget; auto *nr = new QHBoxLayout(netRow); nr->setContentsMargins(0, 0, 0, 0);
+        auto *netName = new QLabel("RX network:");
+        netLevel = new QProgressBar; netLevel->setRange(0, 60); netLevel->setValue(0); netLevel->setTextVisible(true);
+        netLevel->setFormat("—"); netLevel->setMaximumWidth(140);
+        netLevel->setToolTip("Level received on \"FT-710 RX (network)\" (dBFS). Digital silence for more than 2 s counts as link down.");
+        netVol = new QSlider(Qt::Horizontal); netVol->setRange(0, 150); netVol->setPageStep(5);
+        netVol->setTickPosition(QSlider::TicksBelow); netVol->setTickInterval(25); netVol->setValue(naCfg.listenVol);
+        netVol->setToolTip("Volume of the local listen monitor of the network stream (speakers). Does not change the level "
+                           "WSJT-X/fldigi get from \"FT-710 RX (network)\".");
+        netVolLbl = new QLabel(QString("%1%").arg(naCfg.listenVol)); netVolLbl->setMinimumWidth(netVolLbl->fontMetrics().horizontalAdvance("150%  "));
+        netMuteBtn = new QToolButton; netMuteBtn->setCheckable(true); netMuteBtn->setChecked(naCfg.listenMute);
+        netMuteBtn->setToolTip("Listen to the network stream on this computer's speakers. Muted by default because Mumble "
+                               "usually plays the radio audio already (mute one of them to avoid hearing it twice).");
+        netStartBtn = new QPushButton("Start");
+        netStartBtn->setToolTip("Start/stop the network audio stream (also started by Connect and stopped by Disconnect).");
+        nr->addWidget(netName); nr->addWidget(netLevel); nr->addWidget(netVol, 1); nr->addWidget(netVolLbl); nr->addWidget(netMuteBtn); nr->addWidget(netStartBtn);
+        v->addWidget(netRow);
+        auto syncMute = [this](bool on) { netMuteBtn->setText(on ? "Listen: off" : "Listen: on"); netMuteBtn->setStyleSheet(on ? "" : "background:#2a2; color:white;"); };
+        syncMute(naCfg.listenMute);
+        connect(netMuteBtn, &QToolButton::toggled, this, [this, syncMute](bool on) { syncMute(on); na->setListen(netVol->value(), on); });
+        connect(netVol, &QSlider::valueChanged, this, [this](int val) { netVolLbl->setText(QString("%1%").arg(val)); netVolApply.start(); });
+        netVolApply.setSingleShot(true); netVolApply.setInterval(100);
+        connect(&netVolApply, &QTimer::timeout, this, [this] { na->setListen(netVol->value(), netMuteBtn->isChecked()); });
+        connect(netStartBtn, &QPushButton::clicked, this, [this] { if (na->active()) na->stop(false); else na->start(); });
+        na->changed = [this] { updateNetUi(); };
+        na->logLine = [](const QString &m) { QTextStream(stderr) << "netaudio: " << m << Qt::endl; };
         txApply.setSingleShot(true); txApply.setInterval(150);   // coalesce slider drags (one ssh per settle)
         connect(&txApply, &QTimer::timeout, this, [this] { applyTx(txSlider->value()); });
         connect(txSlider, &QSlider::valueChanged, this, [this](int val) {
@@ -642,6 +674,9 @@ public:
         g->addRow("TX keying:", txEnLbl);
         g->addRow("Radio PTT (flrig):", pttLbl);
         g->addRow("VFO:", vfoLbl);
+        netLbl = new QLabel("…"); netLbl->setWordWrap(true);
+        g->addRow("Network audio:", netLbl);
+        statusForm = g;
         v->addWidget(box);
 
         auto *row2 = new QHBoxLayout;
@@ -704,7 +739,10 @@ public:
         pollVolume();
 
         qApp->installEventFilter(this);
-        connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { stopTalk(true); });
+        connect(qApp, &QCoreApplication::aboutToQuit, this, [this] {
+            stopTalk(true);
+            if (na->active() && !naCfg.keepOnExit) na->stop(true);   // leave nothing streaming behind
+        });
 
         timer.setInterval(POLL_IDLE_MS);
         connect(&timer, &QTimer::timeout, this, [this] { poll(); adjustPollRate(); });
@@ -720,6 +758,8 @@ public:
         });
         timer.start();
         applyConfig();
+        // App restarted while the network stream kept running (Settings: keep running): just monitor it.
+        if (naCfg.enabled() && cfg.configured() && NetAudio::localRunning()) na->start(true);
         if (!cfg.configured()) QTimer::singleShot(300, this, [this] { editSettings(); });
     }
 
@@ -975,6 +1015,28 @@ public:
     int txForTest() const { return txSlider->value(); }
     bool txEnabledForTest() const { return txSlider->isEnabled(); }
 private:
+    // --- network audio ---
+    NetAudio *na; QWidget *netRow; QProgressBar *netLevel; QSlider *netVol; QLabel *netVolLbl, *netLbl;
+    QToolButton *netMuteBtn; QPushButton *netStartBtn; QFormLayout *statusForm = nullptr; QTimer netVolApply;
+    void updateNetUi() {
+        const bool on = naCfg.enabled();
+        netRow->setVisible(on);
+        if (statusForm) statusForm->setRowVisible(netLbl, on);
+        if (!on) return;
+        const bool act = na->active();
+        netStartBtn->setText(act ? "Stop" : "Start");
+        const QString st = na->statusText();
+        colored(netLbl, st, !act ? "gray" : na->linkUp() ? "green" : "#c60");
+        const double db = na->levelDb();
+        if (act && db > -119) {
+            netLevel->setValue(int(qBound(0.0, db + 60, 60.0)));
+            netLevel->setFormat(QString("%1 dBFS").arg(db, 0, 'f', 0));
+        } else { netLevel->setValue(0); netLevel->setFormat("—"); }
+        netLevel->setStyleSheet(act && na->linkUp() ? "QProgressBar::chunk { background:#2a2; }" : "QProgressBar::chunk { background:#999; }");
+    }
+public:
+    NetAudio *netAudio() { return na; }
+private:
     QSlider *volSlider; QLabel *volLbl; QToolButton *muteBtn;
     QTimer volTimer, volApply;
     QProcess *volProc = nullptr;
@@ -1172,6 +1234,11 @@ public:
     //    The password comes from the rig host (bridge's server.pw, over ssh) or the local settings,
     //    per Settings > Mumble > Password; it never appears on a command line.
     void doConnect() {
+        // Network audio mode: start the LAN stream too. PTT/TX still go through Mumble + radio-bridge.
+        if (naCfg.enabled() && cfg.configured()) {
+            if (!na->active()) na->start();
+            if (cfg.mumbleUser.isEmpty()) { mumbleLbl->setText("Network audio started (no Mumble user set: no PTT)"); return; }
+        }
         if (!cfg.configured() || cfg.mumbleUser.isEmpty()) {
             QMessageBox::information(this, "Connect", "Set the rig host and your Mumble user name in Settings first.");
             editSettings(); return;
@@ -1248,6 +1315,7 @@ private:
     // Never kills it. Falls back to showing Mumble when it isn't an X11 (XWayland) window.
     void doDisconnect() {
         stopTalk(true);
+        if (na->active()) na->stop(true);   // stop both network-audio units cleanly
         if (!mumbleRunning()) { mumbleLbl->setText("Mumble is not running"); return; }
         QMessageBox mb(QMessageBox::Question, "Disconnect",
             "Stopped talking. Close Mumble now?\n\nThis disconnects from the server and quits Mumble "
@@ -1302,7 +1370,7 @@ private:
             scope->stop();
             if (cfg.configured() || !cfg.scopeHost.isEmpty()) scope->start(cfg.effScopeHost(), quint16(cfg.scopePort));
         }
-        poll(); pollVolume(); updateUi();
+        poll(); pollVolume(); updateUi(); updateNetUi();
     }
     void editSettings() {
         stopTalk();
@@ -1359,6 +1427,52 @@ private:
         auto *spP = port(cfg.scopePort, "ft710-scope TCP port (default 7355).");
         f3->addRow("Scope streamer host:", shE); f3->addRow("Scope streamer port:", spP);
         tabs->addTab(w3, "Band scope");
+        // Network audio
+        auto *w5 = new QWidget; auto *f5 = new QFormLayout(w5);
+        auto *naMode = new QComboBox; naMode->addItems({"Mumble (default)", "LAN stream: ROC (FEC, recommended on LAN)", "LAN stream: RTP"});
+        naMode->setCurrentIndex(naCfg.mode);
+        naMode->setToolTip("Mumble: radio audio comes through Mumble only. LAN stream: the rig host also sends the radio's "
+                           "receive audio straight to this computer with PipeWire, as the capture device \"FT-710 RX (network)\" "
+                           "for WSJT-X, fldigi etc. Receive only; PTT/TX still use Mumble and radio-bridge.");
+        auto *naComp = new QComboBox; naComp->addItems({"None (L16, LAN)", "Opus 24 kbit/s", "Opus 32 kbit/s", "Opus 48 kbit/s", "Opus 64 kbit/s"});
+        static const int kb[] = {24, 32, 48, 64};
+        naComp->setCurrentIndex(naCfg.compression == 1 ? 1 + int(std::find(kb, kb + 4, naCfg.opusKbps) - kb) % 4 : 0);
+        naComp->setToolTip("Opus for VPN / slow links (RTP only; sent with GStreamer opusenc on the rig host). "
+                           "ROC (roc-toolkit 0.4) is PCM only, so ROC always uses L16.");
+        auto *naPort = new QSpinBox; naPort->setRange(1024, 65533); naPort->setValue(naCfg.port);
+        naPort->setToolTip("UDP port on this computer. ROC uses this port and the next two (repair, control).");
+        auto *naLat = new QSpinBox; naLat->setRange(20, 2000); naLat->setSingleStep(10); naLat->setSuffix(" ms"); naLat->setValue(naCfg.latencyMs);
+        naLat->setToolTip("Receive buffer (end-to-end latency is roughly this plus 20-50 ms). 100-150 ms suits a LAN.");
+        auto *naPkt = new QComboBox; for (int ms : {5, 10, 20, 40}) naPkt->addItem(QString("%1 ms").arg(ms), ms);
+        naPkt->setCurrentIndex(qMax(0, naPkt->findData(naCfg.packetMs)));
+        naPkt->setToolTip("RTP packet size. L16: 5 or 10 ms (MTU). Opus: 10-40 ms (20 ms usual). ROC chooses its own.");
+        auto *naFec = new QComboBox; naFec->addItems({"rs8m", "ldpc", "disable"}); naFec->setCurrentText(naCfg.fec);
+        naFec->setToolTip("ROC forward error correction (rs8m: Reed-Solomon, good for audio). Both ends use the same.");
+        auto *naSrc = mk(naCfg.sourceNode, "blank = RB_SOURCE from the bridge's bridge.env",
+                         "PipeWire capture node of the FT-710's USB audio on the rig host (pactl list short sources).");
+        auto *naDest = mk(naCfg.destAddr, "blank = automatic (this computer as the rig host sees it)",
+                          "IP address the rig host sends the stream to. Automatic uses the ssh connection's source address.");
+        auto *naKeep = new QCheckBox("Keep streaming when FT-710 Remote closes"); naKeep->setChecked(naCfg.keepOnExit);
+        f5->addRow("Audio mode:", naMode); f5->addRow("Compression:", naComp); f5->addRow("Port:", naPort);
+        f5->addRow("Buffer / latency:", naLat); f5->addRow("Packet size:", naPkt); f5->addRow("ROC FEC:", naFec);
+        f5->addRow("Source node (rig host):", naSrc); f5->addRow("Send to (this computer):", naDest); f5->addRow("", naKeep);
+        auto *naNote = new QLabel("Needs PipeWire with pipewire-module-roc (ROC) on both computers; Opus needs GStreamer "
+                                  "(pipewire-gstreamer, opus plugins) on the rig host. Pick \"FT-710 RX (network)\" as the input in WSJT-X/fldigi.");
+        naNote->setWordWrap(true); f5->addRow(naNote);
+        auto syncNa = [naMode, naComp, naPkt, naFec, naPort, naLat, naSrc, naDest] {
+            const int m = naMode->currentIndex(); const bool on = m != 0;
+            if (m == 1) naComp->setCurrentIndex(0);
+            naComp->setEnabled(m == 2); naPkt->setEnabled(m == 2); naFec->setEnabled(m == 1);
+            for (QWidget *w : {static_cast<QWidget *>(naPort), static_cast<QWidget *>(naLat), static_cast<QWidget *>(naSrc), static_cast<QWidget *>(naDest)}) w->setEnabled(on);
+        };
+        connect(naMode, &QComboBox::currentIndexChanged, &d, syncNa);
+        connect(naComp, &QComboBox::currentIndexChanged, &d, [naComp, naPkt] {
+            const int ms = naPkt->currentData().toInt();
+            if (naComp->currentIndex() > 0 && ms < 20) naPkt->setCurrentIndex(naPkt->findData(20));
+            if (naComp->currentIndex() == 0 && ms > 10) naPkt->setCurrentIndex(naPkt->findData(10));
+        });
+        syncNa();
+        tabs->addTab(w5, "Network audio");
         // General
         auto *w4 = new QWidget; auto *f4 = new QFormLayout(w4);
         auto *lblE = mk(cfg.stationLabel, "e.g. your callsign", "Shown in the window title.");
@@ -1369,7 +1483,7 @@ private:
         auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
         auto *lay = new QVBoxLayout(&d); lay->addWidget(tabs); lay->addWidget(bb);
         connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
-        Config n;
+        Config n; NetAudioCfg nn;
         connect(bb, &QDialogButtonBox::accepted, &d, [&] {
             n = cfg;
             n.sshHost = sshE->text().trimmed(); n.flrigHost = flrigE->text().trimmed(); n.flrigPort = flrigP->value();
@@ -1381,13 +1495,28 @@ private:
             n.startMinimized = minC->isChecked();
             n.scopeHost = shE->text().trimmed(); n.scopePort = spP->value();
             n.stationLabel = lblE->text().trimmed(); n.helpFile = hfE->text().trimmed();
-            const QString err = n.validate();
+            nn = naCfg;
+            nn.mode = naMode->currentIndex();
+            nn.compression = naComp->currentIndex() > 0 ? 1 : 0;
+            if (naComp->currentIndex() > 0) nn.opusKbps = kb[naComp->currentIndex() - 1];
+            nn.port = naPort->value(); nn.latencyMs = naLat->value(); nn.packetMs = naPkt->currentData().toInt();
+            nn.fec = naFec->currentText(); nn.sourceNode = naSrc->text().trimmed(); nn.destAddr = naDest->text().trimmed();
+            nn.keepOnExit = naKeep->isChecked();
+            QString err = n.validate();
+            if (err.isEmpty()) err = nn.validate();
             if (!err.isEmpty()) { QMessageBox::warning(&d, "Settings", err); return; }
             d.accept();
         });
         d.resize(560, d.sizeHint().height());
         if (d.exec() != QDialog::Accepted) return;
-        cfg = n; cfg.save(); applyConfig();
+        const bool naWasActive = na->active();
+        const QString naBefore = naCfg.describe() + naCfg.sourceNode + naCfg.destAddr + QString::number(naCfg.port);
+        cfg = n; cfg.save();
+        naCfg = nn; naCfg.save();
+        // Network audio: stop it when switched back to Mumble, restart it when its settings changed.
+        if (naWasActive && !naCfg.enabled()) na->stop(false);
+        else if (naWasActive && naBefore != naCfg.describe() + naCfg.sourceNode + naCfg.destAddr + QString::number(naCfg.port)) na->start();
+        applyConfig();
     }
 
     void showHelp() {
@@ -1406,6 +1535,10 @@ private:
               "**Span** and **Level** set the radio's own scope span (1 kHz-1 MHz) and scope level (-30 to +30 dB, 0.5 dB "
               "steps) through flrig (CAT SS05/SS04, display settings only). With \"Auto contrast\" off the colours are fixed, "
               "so Level works like the radio's knob; turn it on to let the app rescale colours itself. "
+              "**Network audio** (Settings > Network audio): instead of only hearing the radio through Mumble, the rig host can "
+              "stream its receive audio straight to this computer (ROC or RTP, optional Opus) as the input device "
+              "\"FT-710 RX (network)\" for WSJT-X/fldigi; Connect starts it, Disconnect stops it, and it restarts itself if the "
+              "link drops. Receive only: PTT and TX audio still go through Mumble. "
               "**Settings…** holds the rig host, flrig, Mumble server and scope addresses.";
         QDialog d(this); d.setWindowTitle("Help / About"); d.resize(640, 520);
         auto *l = new QVBoxLayout(&d); auto *tb = new QTextBrowser; tb->setMarkdown(md); l->addWidget(tb);
@@ -1518,13 +1651,62 @@ static void migrateLegacySettings() {
     now.sync();
 }
 
+// Headless network-audio control (--netaudio start|stop|status|watch SECONDS). Overrides for a test
+// run without touching the saved settings: --na-mode roc|rtp, --na-compression none|opus,
+// --na-bitrate 24|32|48|64, --na-port N, --na-latency MS, --na-packet MS.
+static int netaudioCli(QApplication &app, const QStringList &args, int i) {
+    QTextStream out(stdout);
+    auto opt = [&](const QString &k) { int j = args.indexOf(k); return j >= 0 && j + 1 < args.size() ? args[j + 1] : QString(); };
+    if (QString m = opt("--na-mode"); !m.isEmpty()) naCfg.mode = m == "roc" ? 1 : m == "rtp" ? 2 : 0;
+    if (QString c = opt("--na-compression"); !c.isEmpty()) naCfg.compression = c == "opus" ? 1 : 0;
+    if (QString b = opt("--na-bitrate"); !b.isEmpty()) naCfg.opusKbps = b.toInt();
+    if (QString p = opt("--na-port"); !p.isEmpty()) naCfg.port = p.toInt();
+    if (QString l = opt("--na-latency"); !l.isEmpty()) naCfg.latencyMs = l.toInt();
+    if (QString p = opt("--na-packet"); !p.isEmpty()) naCfg.packetMs = p.toInt();
+    else if (naCfg.effCompression() == 1 && naCfg.packetMs < 20 && !args.contains("--na-packet")) naCfg.packetMs = 20;
+    const QString cmd = i + 1 < args.size() ? args[i + 1] : "status";
+    if (!naCfg.enabled() && cmd != "stop") { out << "netaudio: mode is Mumble (set Settings > Network audio, or --na-mode roc|rtp)" << Qt::endl; return 2; }
+    if (QString e = naCfg.validate(); !e.isEmpty()) { out << "netaudio: invalid settings: " << e << Qt::endl; return 2; }
+    NetAudio na;
+    na.logLine = [&out](const QString &m) { out << QTime::currentTime().toString("HH:mm:ss.zzz") << " " << m << Qt::endl; };
+    if (cmd == "stop") { na.stop(true); out << "netaudio: stopped" << Qt::endl; return 0; }
+    const int secs = cmd == "watch" && i + 2 < args.size() ? args[i + 2].toInt() : cmd == "start" ? 20 : 6;
+    const bool adopt = cmd != "start" && NetAudio::localRunning();
+    if (cmd != "start" && !adopt) { out << "netaudio: not running (local unit inactive)" << Qt::endl; return 1; }
+    out << "netaudio: " << naCfg.describe() << (adopt ? " (monitoring the running stream)" : "") << Qt::endl;
+    na.start(adopt);
+    QElapsedTimer t; t.start(); int lastSec = -1; bool wasUp = false;
+    QTimer tick; tick.setInterval(250);
+    QObject::connect(&tick, &QTimer::timeout, &app, [&] {
+        const int s = int(t.elapsed() / 1000);
+        if (s != lastSec) {
+            lastSec = s;
+            out << QString("t=%1s level=%2 dBFS up=%3 local=%4 remote=%5 | %6").arg(s, 3).arg(na.levelDb(), 6, 'f', 1).arg(na.linkUp())
+                       .arg(na.localState(), na.remoteState(), na.statusText()) << Qt::endl;
+        }
+        if (cmd == "start" && na.linkUp() && !wasUp) { wasUp = true; QTimer::singleShot(3000, &app, [&] { app.exit(0); }); }
+        if (t.elapsed() > secs * 1000) app.exit(cmd == "start" ? (na.linkUp() ? 0 : 1) : 0);
+    });
+    tick.start();
+    const int rc = app.exec();
+    out << "netaudio: source=" << na.source() << " dest=" << na.destination() << " restarts=" << na.restartCount()
+        << " final level=" << QString::number(na.levelDb(), 'f', 1) << " dBFS up=" << na.linkUp() << Qt::endl;
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    {   // command-line-only modes work without a display
+        bool cli = false;
+        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio")) cli = true;
+        if (cli && qEnvironmentVariableIsEmpty("DISPLAY") && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
     QApplication app(argc, argv);
     app.setApplicationName("ft710-remote");
     app.setOrganizationName("FT-710_remote");
     app.setDesktopFileName("ft710-remote");
     migrateLegacySettings();
     cfg.load();
+    naCfg.load();
     if (int i = app.arguments().indexOf("--close-windows-test"); i >= 0 && i + 1 < app.arguments().size()) {   // hidden test hook
         x11::Conn x; const auto ws = x.closableWindows(app.arguments().at(i + 1).toLongLong());
         for (xcb_window_t w : ws) x.requestClose(w);
@@ -1538,9 +1720,14 @@ int main(int argc, char **argv) {
           << "\nmumble=" << cfg.mumbleUser << "@" << cfg.effMumbleHost() << ":" << cfg.mumblePort << "/" << cfg.mumbleChannel
           << " pwSource=" << cfg.pwSource << "\nscope=" << cfg.effScopeHost() << ":" << cfg.scopePort
           << "\nlabel=" << cfg.stationLabel << " help=" << cfg.helpFile << " startMin=" << cfg.startMinimized
-          << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate()) << Qt::endl;
+          << "\nnetaudio=" << naCfg.describe() << " port=" << naCfg.port << " source=" << (naCfg.sourceNode.isEmpty() ? "RB_SOURCE" : naCfg.sourceNode)
+          << " dest=" << (naCfg.destAddr.isEmpty() ? "auto" : naCfg.destAddr) << " keepOnExit=" << naCfg.keepOnExit
+          << " listen=" << (naCfg.listenMute ? "muted" : QString::number(naCfg.listenVol) + "%")
+          << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate())
+          << (naCfg.validate().isEmpty() ? "" : " netaudio: " + naCfg.validate()) << Qt::endl;
         return 0;
     }
+    if (int i = app.arguments().indexOf("--netaudio"); i >= 0) return netaudioCli(app, app.arguments(), i);
     Main w;
     if (!w.restoreSavedGeometry())
         w.resize(QSettings().value("showScope", true).toBool() ? QSize(760, 880) : QSize(520, 560));

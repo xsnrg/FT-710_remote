@@ -27,6 +27,10 @@ It has two halves:
   **MENU → SCU-LAN10 = ON**. The client shows spectrum + waterfall, with span and
   reference-level / auto-contrast controls, and **click-to-tune** (sets VFO-A via flrig;
   frequency only).
+* **Network audio (optional, receive only)** – instead of hearing the radio only through
+  Mumble, the rig host streams the radio's receive audio straight to the desktop with
+  PipeWire (ROC with FEC, or RTP; optional Opus compression for VPN use). It appears as the
+  input device **"FT-710 RX (network)"** for WSJT-X, fldigi etc. See [Network audio](#network-audio).
 * Status of murmur, the bridge, flrig and `tx_enabled` polled over ssh.
 * Window size, volumes and scope settings remembered between runs.
 * Optional: start Mumble minimized (hidden in its tray icon). **Disconnect…** offers to close
@@ -133,6 +137,8 @@ On first start the **Settings…** dialog opens. Tabs:
   server password comes from: read `server.pw` on the rig host over ssh, none (use
   Mumble's saved login), or stored locally in the settings file; "start Mumble minimized".
 * **Band scope** – streamer host (blank = rig host) and port.
+* **Network audio** – audio mode (Mumble / LAN stream ROC / LAN stream RTP), compression,
+  port, buffer, packet size, ROC FEC, source node, send-to address. See below.
 * **General** – station label for the window title, optional help/notes file, path of
   the settings file.
 
@@ -144,6 +150,86 @@ and exits.
 
 Settings from an older build (`~/.config/<anything>/ft710-remote.conf`) are imported
 once on first start; keys already present are not overwritten.
+
+## Network audio
+
+**Settings → Network audio → Audio mode**:
+
+| Mode | What it does |
+|---|---|
+| **Mumble** (default) | As before: radio audio only through Mumble. |
+| **LAN stream: ROC** | PipeWire `roc-sink` on the rig host → `roc-source` on the desktop, Reed-Solomon FEC (`rs8m`) repairs lost packets. Recommended on a LAN. L16 only. |
+| **LAN stream: RTP** | PipeWire `rtp-sink` → `rtp-source`. Compression **None** (L16) or **Opus 24/32/48/64 kbit/s** for VPN / slow links. |
+
+The stream is **receive only**. PTT and TX audio still go through Mumble and radio-bridge
+exactly as before (keep Mumble connected for PTT; mute Mumble's playback or leave the app's
+"Listen" off so you do not hear the radio twice).
+
+How it works:
+* **Connect** starts the stream (and Mumble as usual), **Disconnect** stops it, and it is
+  stopped when the app quits (unless "keep streaming" is ticked). The **Start/Stop** button in
+  the "RX network" row controls it on its own.
+* The app writes the configs from built-in templates and runs them as systemd **user** units:
+  `ft710-netaudio-recv` locally (config in `~/.config/FT-710_remote/netaudio/`) and
+  `ft710-netaudio-send` on the rig host over ssh (config in `~/.config/ft710-netaudio/`).
+  Nothing about your setup is hard-coded: the rig host is the ssh host from Settings, the
+  source is the **Source node** setting or, if blank, `RB_SOURCE` from the bridge's
+  `bridge.env`, and the destination is this computer's address as the rig host sees it
+  (or the **Send to** setting).
+* The sender captures only that node (`node.dont-fallback`): if the radio's USB audio is
+  missing it is not started (no fallback to another microphone), and it is restarted when the
+  device comes back.
+* **Health**: the app meters the received level (shown as dBFS in the "RX network" row),
+  polls both units, and treats digital silence for more than 2 s or a stopped unit as *link
+  down*. It then restarts the sender (every third try both ends) with 1 / 2 / 5 / 10 s backoff.
+  The status line shows state, uptime and restart count.
+* **Listen** plays the stream on this computer's speakers via a `pw-loopback` with its own
+  volume (0–150 %); off by default. It never changes what WSJT-X/fldigi record.
+
+**WSJT-X / fldigi**: choose **FT-710 RX (network)** as the audio input (WSJT-X: Settings →
+Audio → Input; fldigi: Configure → Sound Card → PulseAudio/PortAudio capture). It is a
+normal PipeWire/Pulse source (`ft710_rx_net`), mono 48 kHz. Transmit audio is unchanged.
+
+Requirements:
+* PipeWire ≥ 1.0 on both computers (`pipewire -c`, `pw-record`, `pw-loopback`, `pactl`).
+* **ROC**: `pipewire-module-roc` (roc-toolkit ≥ 0.4) on **both** computers
+  (Fedora: `sudo dnf install pipewire-module-roc`; Debian/Ubuntu: `pipewire-roc` / `libpipewire-0.3-modules`).
+* **Opus**: GStreamer on the rig host with the PipeWire and Opus plugins
+  (`gst-launch-1.0`, `pipewiresrc`, `opusenc`, `rtpopuspay`; Fedora: `gstreamer1-plugins-base
+  gstreamer1-plugins-good pipewire-gstreamer`). roc-toolkit 0.4 has no Opus codec and
+  PipeWire's own RTP Opus encoder has no bitrate setting, so Opus is sent with GStreamer
+  and received by PipeWire's `rtp-source` (`sess.media = "opus"`).
+* Firewall on the desktop: UDP **port, port+1, port+2** for ROC (default 10001–10003),
+  UDP **port** for RTP.
+
+Measured on a LAN (FT-710 USB audio, mono 48 kHz, rig host sender / desktop receiver):
+
+| Mode | Wire bitrate | Sender CPU | Receiver CPU | Notes |
+|---|---|---|---|---|
+| RTP L16, 10 ms packets | ~800 kbit/s | 1.7 % (pipewire, 11 MB) | 0.2 % | lossless; 95–150 ms with 100 ms buffer |
+| ROC L16, rs8m FEC, 120 ms | ~1160 kbit/s (743 source + 411 repair + 4 control) | 1.6–1.8 % (10 MB) | 1.3–1.7 % | ~160–170 ms; survives packet loss |
+| RTP Opus 24 kbit/s, 20 ms | 24 kbit/s payload, ~41 kbit/s on the wire | 2.7–4 % (gst-launch, 18 MB) | 0.4 % | 50 packets/s |
+| RTP Opus 32 kbit/s | 25 kbit/s payload, ~42 kbit/s wire | 3–4.6 % | 0.4 % | VBR: SSB audio needs less than the target |
+| RTP Opus 48 kbit/s | 53 kbit/s payload, ~70 kbit/s wire | 3.2 % | 0.3 % | |
+| RTP Opus 64 kbit/s | 69 kbit/s payload, ~86 kbit/s wire | 3.4 % | 0.3 % | |
+| Mumble (for comparison) | ~72 kbit/s | bridge 6.6 %, murmur 1.3 % | client 1.2 % (143 MB) | |
+
+Opus is lossy; for digital modes on a LAN prefer L16. 32–48 kbit/s is plenty for SSB/FT8
+over a VPN.
+
+Optional unit files (`server/netaudio/ft710-netaudio-send.service`,
+`app/netaudio/ft710-netaudio-recv.service`): copy them to `~/.config/systemd/user/` if you
+want the units to be regular installed services; the app then uses `systemctl --user
+restart` instead of a transient `systemd-run` unit. The `*.in` files in the same folders are
+the templates compiled into the app.
+
+Command line (handy for testing; `--na-*` overrides are not saved):
+
+```sh
+ft710-remote --netaudio start [--na-mode roc|rtp] [--na-compression none|opus] [--na-bitrate 32] [--na-port N] [--na-latency MS]
+ft710-remote --netaudio watch 30    # monitor a running stream: level, unit states, recoveries
+ft710-remote --netaudio stop
+```
 
 ## Safety
 

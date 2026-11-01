@@ -1,0 +1,13 @@
+#!/bin/sh
+# FT-710 Remote network audio: rig-host sender, RTP + Opus at a fixed bitrate (for VPN / slow links).
+# Template: ft710-remote fills in the @...@ values and writes ~/.config/ft710-netaudio/sender.sh.
+# PipeWire's own RTP Opus sender has no bitrate setting, so this uses GStreamer (pipewiresrc,
+# opusenc, rtpopuspay; packages pipewire-gstreamer + gstreamer1-plugins-base/-good). The operator
+# side receives it with PipeWire's rtp-source (sess.media = "opus"). Receive audio only.
+exec gst-launch-1.0 -q \
+  pipewiresrc target-object="@SOURCE@" client-name=ft710-netaudio-send \
+    stream-properties="props,node.name=ft710_netaudio_send,node.dont-fallback=true,node.dont-reconnect=true,application.name=ft710-netaudio-send" \
+  ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=1 \
+  ! opusenc bitrate=@BITRATE@ frame-size=@PTIME@ audio-type=generic bandwidth=fullband \
+  ! rtpopuspay pt=96 mtu=1280 \
+  ! udpsink host="@DEST_IP@" port=@PORT@ sync=false async=false

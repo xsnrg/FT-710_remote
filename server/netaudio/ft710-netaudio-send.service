@@ -1,0 +1,17 @@
+# Optional, for running the network-audio sender without the app (the app normally starts it as a
+# transient unit of the same name). If this file is installed in ~/.config/systemd/user/, the app
+# uses "systemctl --user restart ft710-netaudio-send" instead and only rewrites the config files.
+# The config is written by ft710-remote (or by hand from sender-*.in) to ~/.config/ft710-netaudio/.
+[Unit]
+Description=FT-710 Remote network audio sender (radio RX audio to the operator desktop)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'd="$HOME/.config/ft710-netaudio"; if [ -f "$d/sender.sh" ]; then exec /bin/sh "$d/sender.sh"; else exec /usr/bin/pipewire -c "$d/sender.conf"; fi'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+# Optional: run the network-audio receiver without the app (the app normally starts it as a
+# transient unit of the same name, from ~/.config/FT-710_remote/netaudio/receiver.conf).
+[Unit]
+Description=FT-710 Remote network audio receiver ("FT-710 RX (network)" capture device)
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c %h/.config/FT-710_remote/netaudio/receiver.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

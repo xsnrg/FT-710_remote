@@ -1,0 +1,41 @@
+# FT-710 Remote network audio: rig-host sender, RTP (uncompressed L16, 48 kHz mono).
+# Template: ft710-remote fills in the @...@ values and writes ~/.config/ft710-netaudio/sender.conf
+# on the rig host. Receive audio only (reads the radio's USB capture node, never writes to it).
+context.properties = { log.level = 2 }
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-rt args = { nice.level = -11 } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-rtp-sink
+        args = {
+            destination.ip = "@DEST_IP@"
+            destination.port = @PORT@
+            net.mtu = 1280
+            net.ttl = 4
+            sess.min-ptime = @PTIME@
+            sess.max-ptime = @PTIME@
+            sess.latency.msec = @PTIME@
+            sess.name = "FT-710 RX"
+            sess.media = "audio"
+            audio.format = "S16BE"
+            audio.rate = 48000
+            audio.channels = 1
+            audio.position = [ MONO ]
+            stream.props = {
+                node.name = "ft710_netaudio_send"
+                node.description = "FT-710 RX network sender (RTP)"
+                media.class = "Stream/Input/Audio"
+                target.object = "@SOURCE@"
+                node.autoconnect = true
+                node.dont-fallback = true
+                node.dont-reconnect = true
+                application.name = "ft710-netaudio-send"
+            }
+        }
+    }
+]

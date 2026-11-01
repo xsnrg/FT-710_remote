@@ -1,0 +1,42 @@
+# FT-710 Remote network audio: rig-host sender, ROC (roc-toolkit, PCM + FEC).
+# Template: ft710-remote fills in the @...@ values and writes ~/.config/ft710-netaudio/sender.conf
+# on the rig host. Receive audio only: it reads the radio's USB capture node (shared with
+# radio-bridge, WSJT-X, ...) and never writes to the radio. Run as its own PipeWire client:
+#   pipewire -c ~/.config/ft710-netaudio/sender.conf
+context.properties = { log.level = 2 }
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-rt args = { nice.level = -11 } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-roc-sink
+        args = {
+            remote.ip = "@DEST_IP@"
+            remote.source.port = @PORT_SOURCE@
+            remote.repair.port = @PORT_REPAIR@
+            remote.control.port = @PORT_CONTROL@
+            fec.code = @FEC@
+            audio.rate = 48000
+            audio.channels = 1
+            audio.position = [ MONO ]
+            sink.name = "ft710_netaudio_send"
+            sink.props = {
+                node.name = "ft710_netaudio_send"
+                node.description = "FT-710 RX network sender (ROC)"
+                media.class = "Stream/Input/Audio"
+                target.object = "@SOURCE@"
+                # roc-sink is created as a virtual sink; these make WirePlumber link it to target.object
+                node.autoconnect = true
+                node.virtual = false
+                # never fall back to another microphone if the radio's USB audio disappears
+                node.dont-fallback = true
+                node.dont-reconnect = true
+                application.name = "ft710-netaudio-send"
+            }
+        }
+    }
+]
