@@ -166,4 +166,4 @@ once on first start; keys already present are not overwritten.
 * VLSC – prior work on the Yaesu scope stream.
 * Mumble / pymumble, flrig.
 
-No license has been chosen yet; all rights reserved by the author until one is added.
+Copyright (C) 2026 Jim Howard. Licensed under the GNU General Public License v3.0 or later; see [LICENSE](LICENSE).
