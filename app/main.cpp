@@ -1,0 +1,1503 @@
+// FT-710 Remote: small Qt6 front end for a remote Yaesu FT-710 behind a Mumble audio bridge
+// (radio-bridge) and flrig on the "rig host". All station settings come from the Settings dialog.
+// PTT goes to the local Mumble client over its RPC socket ($XDG_RUNTIME_DIR/MumbleSocket),
+// the same channel `mumble rpc starttalking` uses, so the server password never hits argv.
+#include <QtWidgets>
+#include <QLocalSocket>
+#include <QTcpSocket>
+#include <functional>
+#include <cmath>
+#include <QDomDocument>
+#include <QtDBus/QDBusInterface>
+#include <QtDBus/QDBusReply>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <xcb/xcb.h>
+#include <cstdlib>
+#include <cstring>
+
+// Minimal X11 (XWayland) helpers. Mumble 1.4 has no "start minimized" option, and on native
+// Wayland no other program may minimize its window. So when FT-710 Remote launches Mumble with
+// "Start Mumble minimized" on, it runs Mumble under XWayland (QT_QPA_PLATFORM=xcb) and asks the
+// window manager to iconify its main window (ICCCM WM_CHANGE_STATE). Mumble then hides itself in
+// its top-bar tray icon (its default "hide in tray when minimized" behaviour).
+namespace x11 {
+struct Conn {
+    xcb_connection_t *c = nullptr; xcb_window_t root = 0;
+    Conn() {
+        int scr = 0; c = xcb_connect(nullptr, &scr);
+        if (xcb_connection_has_error(c)) { xcb_disconnect(c); c = nullptr; return; }
+        auto it = xcb_setup_roots_iterator(xcb_get_setup(c));
+        for (int i = 0; i < scr && it.rem; ++i) xcb_screen_next(&it);
+        root = it.data->root;
+    }
+    ~Conn() { if (c) xcb_disconnect(c); }
+    xcb_atom_t atom(const char *n) {
+        auto *r = xcb_intern_atom_reply(c, xcb_intern_atom(c, 0, uint16_t(strlen(n)), n), nullptr);
+        xcb_atom_t a = r ? r->atom : xcb_atom_t(XCB_ATOM_NONE); free(r); return a;
+    }
+    QByteArray prop(xcb_window_t w, xcb_atom_t a, xcb_atom_t type) {
+        auto *r = xcb_get_property_reply(c, xcb_get_property(c, 0, w, a, type, 0, 4096), nullptr);
+        QByteArray out;
+        if (r && r->format) out = QByteArray((const char *)xcb_get_property_value(r), xcb_get_property_value_length(r) * (r->format / 8));
+        free(r); return out;
+    }
+    void clientMessage(xcb_window_t w, xcb_atom_t type, uint32_t d0, uint32_t d1 = 0, uint32_t d2 = 0) {
+        xcb_client_message_event_t ev{};
+        ev.response_type = XCB_CLIENT_MESSAGE; ev.format = 32; ev.window = w; ev.type = type;
+        ev.data.data32[0] = d0; ev.data.data32[1] = d1; ev.data.data32[2] = d2;
+        xcb_send_event(c, 0, root, XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY, (const char *)&ev);
+        xcb_flush(c);
+    }
+    // Managed, non-transient top-level windows of Mumble: by PID if given, else by WM_CLASS.
+    QList<xcb_window_t> mumbleWindows(qint64 pid, bool viewableOnly) {
+        QList<xcb_window_t> res;
+        if (!c) return res;
+        QByteArray list = prop(root, atom("_NET_CLIENT_LIST"), XCB_ATOM_WINDOW);
+        const xcb_atom_t aPid = atom("_NET_WM_PID");
+        for (int i = 0; i + 4 <= list.size(); i += 4) {
+            xcb_window_t w; memcpy(&w, list.constData() + i, 4);
+            if (!prop(w, XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW).isEmpty()) continue;
+            if (pid > 0) {
+                QByteArray p = prop(w, aPid, XCB_ATOM_CARDINAL);
+                uint32_t v = 0; if (p.size() >= 4) memcpy(&v, p.constData(), 4);
+                if (qint64(v) != pid) continue;
+            } else if (!prop(w, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING).toLower().contains("mumble")) continue;
+            if (viewableOnly) {
+                auto *a = xcb_get_window_attributes_reply(c, xcb_get_window_attributes(c, w), nullptr);
+                bool vis = a && a->map_state == XCB_MAP_STATE_VIEWABLE; free(a);
+                if (!vis) continue;
+            }
+            res.append(w);
+        }
+        return res;
+    }
+    void iconify(xcb_window_t w) { clientMessage(w, atom("WM_CHANGE_STATE"), 3 /*IconicState*/); }
+    void activate(xcb_window_t w) { clientMessage(w, atom("_NET_ACTIVE_WINDOW"), 2 /*pager*/, XCB_CURRENT_TIME); }
+};
+}
+
+// ---------------------------------------------------------------------------------------------
+// Station configuration (QSettings, edited in the Settings dialog). Nothing station-specific is
+// compiled in. The "rig host" is the machine with the FT-710, flrig, radio-bridge and ft710-scope;
+// this app reaches it with ssh (key-based login, BatchMode) for status, TX enable and CAT via flrig.
+static QString shq(const QString &s) { QString r = s; r.replace("'", "'\\''"); return "'" + r + "'"; }
+static QString hostPart(const QString &dest) { const int at = dest.lastIndexOf('@'); return at >= 0 ? dest.mid(at + 1) : dest; }
+
+struct Config {
+    QString sshHost;                                  // ssh destination: alias, host or user@host
+    QString flrigHost = "127.0.0.1"; int flrigPort = 12345;   // flrig XML-RPC as seen from the rig host
+    QString bridgeService = "radio-bridge";           // systemd --user unit on the rig host
+    QString murmurService = "murmur";                 // system unit of the Mumble server ("" = don't check)
+    QString bridgeCfgDir = "~/.config/radio-bridge";  // tx_enabled, tx_gain, server.pw on the rig host
+    QString bridgeUser = "FT710";                     // Mumble name the bridge uses (status display)
+    QString mumbleHost; int mumblePort = 64738;       // "" = same host as the rig host
+    QString mumbleUser, mumbleChannel;
+    int pwSource = 0;   // 0 = read <bridge dir>/server.pw over ssh, 1 = none / Mumble's saved login, 2 = stored locally
+    QString mumblePassword;                           // only used with pwSource 2 (plain text in the local config)
+    bool startMinimized = true;
+    QString scopeHost; int scopePort = 7355;          // "" = same host as the rig host
+    QString stationLabel;                             // shown in the window title (e.g. your callsign)
+    QString helpFile;                                 // optional local Markdown notes shown in Help
+
+    bool configured() const { return !sshHost.isEmpty(); }
+    QString rigName() const { return configured() ? hostPart(sshHost) : QString("rig host"); }
+    QString effMumbleHost() const { return mumbleHost.isEmpty() ? hostPart(sshHost) : mumbleHost; }
+    QString effScopeHost() const { return scopeHost.isEmpty() ? hostPart(sshHost) : scopeHost; }
+    QString flrigUrl() const {
+        return QString("http://%1:%2/RPC2").arg(flrigHost.contains(':') ? "[" + flrigHost + "]" : flrigHost).arg(flrigPort);
+    }
+    // Shell expression for a file in the bridge's config dir on the rig host ("~/" stays expandable).
+    QString remoteFile(const QString &name) const {
+        QString d = bridgeCfgDir; while (d.endsWith('/') && d.size() > 1) d.chop(1);
+        if (d == "~") return "\"$HOME\"/" + shq(name);
+        if (d.startsWith("~/")) return "\"$HOME\"/" + shq(d.mid(2) + "/" + name);
+        return shq(d + "/" + name);
+    }
+    void load() {
+        QSettings st; Config def;
+        sshHost = st.value("rig/sshHost").toString().trimmed();
+        flrigHost = st.value("rig/flrigHost", def.flrigHost).toString().trimmed();
+        flrigPort = st.value("rig/flrigPort", def.flrigPort).toInt();
+        bridgeService = st.value("rig/bridgeService", def.bridgeService).toString().trimmed();
+        murmurService = st.value("rig/murmurService", def.murmurService).toString().trimmed();
+        bridgeCfgDir = st.value("rig/bridgeConfigDir", def.bridgeCfgDir).toString().trimmed();
+        bridgeUser = st.value("rig/bridgeMumbleUser", def.bridgeUser).toString().trimmed();
+        mumbleHost = st.value("mumble/host").toString().trimmed();
+        mumblePort = st.value("mumble/port", def.mumblePort).toInt();
+        mumbleUser = st.value("mumble/user").toString().trimmed();
+        mumbleChannel = st.value("mumble/channel").toString().trimmed();
+        pwSource = st.value("mumble/passwordSource", 0).toInt();
+        mumblePassword = st.value("mumble/password").toString();
+        startMinimized = st.value("startMumbleMinimized", true).toBool();
+        scopeHost = st.value("scopeHost").toString().trimmed();
+        scopePort = st.value("scopePort", def.scopePort).toInt();
+        stationLabel = st.value("station/label").toString().trimmed();
+        helpFile = st.value("station/helpFile").toString().trimmed();
+    }
+    void save() const {
+        QSettings st;
+        st.setValue("rig/sshHost", sshHost); st.setValue("rig/flrigHost", flrigHost); st.setValue("rig/flrigPort", flrigPort);
+        st.setValue("rig/bridgeService", bridgeService); st.setValue("rig/murmurService", murmurService);
+        st.setValue("rig/bridgeConfigDir", bridgeCfgDir); st.setValue("rig/bridgeMumbleUser", bridgeUser);
+        st.setValue("mumble/host", mumbleHost); st.setValue("mumble/port", mumblePort);
+        st.setValue("mumble/user", mumbleUser); st.setValue("mumble/channel", mumbleChannel);
+        st.setValue("mumble/passwordSource", pwSource);
+        if (pwSource == 2) st.setValue("mumble/password", mumblePassword); else st.remove("mumble/password");
+        st.setValue("startMumbleMinimized", startMinimized);
+        st.setValue("scopeHost", scopeHost); st.setValue("scopePort", scopePort);
+        st.setValue("station/label", stationLabel); st.setValue("station/helpFile", helpFile);
+        st.sync();
+        // The file may hold a Mumble password: keep it owner-only.
+        QFile::setPermissions(st.fileName(), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    }
+    // Returns "" if valid, else a message. Strict on anything that reaches a shell or ssh's argv.
+    QString validate() const {
+        static const QRegularExpression dest("^([A-Za-z0-9._-]+@)?[A-Za-z0-9_][A-Za-z0-9._-]*$"),
+            host("^([A-Za-z0-9_][A-Za-z0-9._-]*|\\[?[0-9A-Fa-f:.]+\\]?)$"),
+            unit("^[A-Za-z0-9_][A-Za-z0-9@._-]*$"), path("^(~|~/|/)?[A-Za-z0-9._/ +-]*$"),
+            user("^[^/@:#?\\s][^/@:#?]{0,63}$");
+        if (sshHost.isEmpty()) return "Rig host (ssh) is required.";
+        if (!dest.match(sshHost).hasMatch()) return "Rig host (ssh) must look like host, alias or user@host.";
+        if (!host.match(flrigHost).hasMatch()) return "flrig host is not a valid host name or address.";
+        if (!unit.match(bridgeService).hasMatch()) return "Bridge service name is not a valid systemd unit name.";
+        if (!murmurService.isEmpty() && !unit.match(murmurService).hasMatch()) return "Mumble server service name is not a valid unit name.";
+        if (bridgeCfgDir.isEmpty() || !path.match(bridgeCfgDir).hasMatch()) return "Bridge config dir must be a plain path (~/... or /...).";
+        if (!mumbleHost.isEmpty() && !host.match(mumbleHost).hasMatch()) return "Mumble server is not a valid host name or address.";
+        if (mumbleUser.isEmpty() || !user.match(mumbleUser).hasMatch()) return "Mumble user name is required (no / @ : # ?).";
+        if (!bridgeUser.isEmpty() && !user.match(bridgeUser).hasMatch()) return "Bridge Mumble name contains invalid characters.";
+        if (mumbleChannel.contains("//") || mumbleChannel.contains('?') || mumbleChannel.contains('#')) return "Mumble channel: use Parent/Child, no ? or #.";
+        if (!scopeHost.isEmpty() && !host.match(scopeHost).hasMatch()) return "Scope host is not a valid host name or address.";
+        if (pwSource == 2 && mumblePassword.isEmpty()) return "Enter the Mumble password, or pick another password source.";
+        return {};
+    }
+};
+static Config cfg;
+
+static QStringList sshArgs(const QString &cmd) {
+    const QString cp = QDir::home().filePath(".ssh/cm-ft710-%r@%h:%p");
+    return {"-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ControlMaster=auto",
+            "-o", "ControlPath=" + cp, "-o", "ControlPersist=120", "--", cfg.sshHost, cmd};
+}
+
+// Blocking ssh helper for short commands. Returns stdout; ok=false on failure.
+static QByteArray sshRun(const QString &cmd, bool *ok = nullptr, int ms = 10000) {
+    if (!cfg.configured()) { if (ok) *ok = false; return {}; }
+    QProcess p;
+    p.start("ssh", sshArgs(cmd));
+    bool good = p.waitForFinished(ms) && p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0;
+    if (!good && p.state() != QProcess::NotRunning) p.kill(), p.waitForFinished(1000);
+    if (ok) *ok = good;
+    return p.readAllStandardOutput();
+}
+
+static QString mumbleSocketPath() {
+    QString rt = qEnvironmentVariable("XDG_RUNTIME_DIR");
+    if (!rt.isEmpty() && QDir(rt).exists()) return QDir(rt).filePath("MumbleSocket");
+    return QDir::home().filePath(".MumbleSocket");
+}
+
+// Send one request to Mumble's RPC socket. elem = "self"/"url"; params as child elements.
+static bool mumbleRpc(const QString &elem, const QList<QPair<QString, QString>> &params) {
+    QLocalSocket s;
+    s.connectToServer(mumbleSocketPath());
+    if (!s.waitForConnected(500)) return false;
+    QDomDocument d;
+    QDomElement r = d.createElement(elem);
+    for (auto &kv : params) {
+        QDomElement e = d.createElement(kv.first);
+        e.appendChild(d.createTextNode(kv.second));
+        r.appendChild(e);
+    }
+    d.appendChild(r);
+    s.write(d.toByteArray());
+    s.flush();
+    if (!s.waitForReadyRead(1500)) return false;
+    QDomDocument rep;
+    rep.setContent(s.readAll());
+    return rep.firstChildElement("reply").firstChildElement("succeeded").text() == "true";
+}
+static bool mumbleRunning() {
+    QLocalSocket s;
+    s.connectToServer(mumbleSocketPath());
+    return s.waitForConnected(300);
+}
+
+// One ssh round trip per poll. Prints key=value lines, then the log if asked.
+// Settings arrive as shell variables (BRIDGE, MURMUR, TXEN, TXGAIN, FLRIG) prepended by pollScript().
+static const char *POLL_SCRIPT = R"SH(
+if [ -n "$MURMUR" ]; then echo "murmur=$(systemctl is-active "$MURMUR" 2>/dev/null)"; else echo "murmur=not checked"; fi
+echo "bridge=$(systemctl --user is-active "$BRIDGE" 2>/dev/null)"
+[ -e "$TXEN" ] && echo tx=on || echo tx=off
+INV=$(systemctl --user show -p InvocationID --value "$BRIDGE" 2>/dev/null)
+if [ -n "$INV" ]; then J=$(journalctl --user _SYSTEMD_INVOCATION_ID=$INV --no-pager -o cat 2>/dev/null | tail -n 400); fi
+echo "conn=$(printf '%s\n' "$J" | grep -E 'Mumble (connected|disconnected)|status connected=' | tail -1)"
+echo "status=$(printf '%s\n' "$J" | grep 'status connected=' | tail -1)"
+rpc() { curl -s -m 2 -H 'Content-Type: text/xml' -d "<?xml version=\"1.0\"?><methodCall><methodName>$1</methodName></methodCall>" "$FLRIG" | tr -d '\n\t ' | sed -n 's/.*<value>\(<[a-z0-9]*>\)\{0,1\}\([^<]*\).*/\2/p'; }
+echo "ptt=$(rpc rig.get_ptt)"
+echo "vfo=$(rpc rig.get_vfo)"
+echo "txgain=$(cat "$TXGAIN" 2>/dev/null || echo none)"
+if [ "$1" = log ]; then echo ---LOG---; journalctl --user -u "$BRIDGE" -n 20 --no-pager 2>/dev/null; fi
+)SH";
+static QByteArray pollScript() {
+    const QString vars = QString("BRIDGE=%1\nMURMUR=%2\nTXEN=%3\nTXGAIN=%4\nFLRIG=%5\n")
+        .arg(shq(cfg.bridgeService), shq(cfg.murmurService), cfg.remoteFile("tx_enabled"), cfg.remoteFile("tx_gain"), shq(cfg.flrigUrl()));
+    return (vars + POLL_SCRIPT).toUtf8();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Band scope: spectrum + waterfall from the ft710-scope streamer on the rig host (TCP 7355 by default). The FT-710
+// sends its own scope data (magnitude only, ~850 bins) over the FT4222 inside the radio when
+// MENU SCU-LAN10 is ON; server/ft710-scope/ft710_scope.py on the rig host reads it and serves it here.
+// Wire format (little-endian): header "<4sBBHIdQQIBBBBBxxxH" (50 bytes) = magic "F7SC", version,
+// hdr_len, nbins, seq, unix time (double), vfoa_hz, start_hz, span_hz, flags, mode, span_code,
+// scope_mode, smeter, meta_len; then meta_len raw parameter bytes, then nbins magnitude bytes.
+// flags bit0 = data, bit1 = fixed-edge scope, bit7 = status only (no data from the radio).
+// Read-only: the only thing it can do to the radio is a frequency change (flrig rig.set_vfo)
+// when you click in it, and only while the radio is receiving.
+class ScopeWidget : public QWidget {
+public:
+    std::function<void(double)> onTune;          // set by Main; called with Hz on a click
+    std::function<bool()> canTune;               // false while transmitting
+    std::function<void(int)> onSpanCode;         // span code (0-9) from the frame header, when it changes
+    bool clickToTune = true;
+    bool autoContrast = false;                   // off: fixed colour scale, so the radio's scope LEVEL shows
+    int lastSpanCode = -1;
+
+    explicit ScopeWidget(QWidget *parent = nullptr) : QWidget(parent) {
+        setMinimumHeight(260);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        setMouseTracking(true);
+        setCursor(Qt::CrossCursor);
+        retry.setSingleShot(true); retry.setInterval(3000);
+        QObject::connect(&retry, &QTimer::timeout, this, [this] { open(); });
+        QObject::connect(&sock, &QTcpSocket::readyRead, this, [this] { readData(); });
+        QObject::connect(&sock, &QTcpSocket::connected, this, [this] { setStatus("connected — waiting for scope data"); });
+        QObject::connect(&sock, &QTcpSocket::disconnected, this, [this] { lost("disconnected"); });
+        QObject::connect(&sock, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) { lost(sock.errorString()); });
+        stale.setInterval(1000);
+        QObject::connect(&stale, &QTimer::timeout, this, [this] {
+            if (lastData.isValid() && lastData.elapsed() > 2500 && status.isEmpty()) { setStatus("no scope data"); }
+        });
+    }
+    void start(const QString &host, quint16 port) { this->host = host; this->port = port; running = true; stale.start(); open(); }
+    void stop() {
+        running = false; retry.stop(); stale.stop();
+        sock.abort(); buf.clear(); lastSpanCode = -1;
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(8, 8, 20));
+        const QRect area = rect().adjusted(0, 0, 0, -axisH);
+        const int specH = area.height() * 35 / 100;
+        const QRect spec(area.left(), area.top(), area.width(), specH), wfr(area.left(), specH, area.width(), area.height() - specH);
+        if (!wf.isNull()) p.drawImage(wfr, wf);
+        // spectrum trace
+        if (!spectrum.isEmpty()) {
+            p.fillRect(spec, QColor(10, 14, 30));
+            QPolygonF line; const int n = spectrum.size();
+            for (int i = 0; i < n; ++i) {
+                double x = spec.left() + (i + 0.5) * spec.width() / n;
+                double y = spec.bottom() - qBound(0.0, (uchar(spectrum[i]) - lo) / qMax(1.0, hi - lo), 1.0) * (spec.height() - 4);
+                line << QPointF(x, y);
+            }
+            QPolygonF fill = line; fill << QPointF(spec.right(), spec.bottom()) << QPointF(spec.left(), spec.bottom());
+            p.setPen(Qt::NoPen); p.setBrush(QColor(40, 120, 220, 90)); p.drawPolygon(fill);
+            p.setPen(QPen(QColor(120, 210, 255), 1)); p.setBrush(Qt::NoBrush); p.drawPolyline(line);
+        }
+        // passband + VFO marker
+        if (span > 0 && vfo > 0) {
+            auto [a, b] = passband();
+            const double x0 = xOf(vfo + a), x1 = xOf(vfo + b), xv = xOf(vfo);
+            p.fillRect(QRectF(qMin(x0, x1), area.top(), qMax(1.0, qAbs(x1 - x0)), area.height()), QColor(255, 255, 255, 38));
+            p.setPen(QPen(QColor(255, 80, 80), 1)); p.drawLine(QPointF(xv, area.top()), QPointF(xv, area.bottom()));
+        }
+        // axis
+        p.fillRect(QRect(0, area.bottom() + 1, width(), axisH), QColor(20, 20, 30));
+        p.setPen(QColor(200, 200, 200));
+        if (span > 0) {
+            const double step = niceStep(span / qMax(2.0, width() / 90.0));
+            const int dec = step >= 1e6 ? 0 : step >= 1e5 ? 1 : step >= 1e4 ? 2 : step >= 1e3 ? 3 : step >= 100 ? 4 : 5;
+            for (double f = std::ceil(startHz / step) * step; f <= startHz + span; f += step) {
+                const double x = xOf(f);
+                p.drawLine(QPointF(x, area.bottom() + 1), QPointF(x, area.bottom() + 5));
+                const QString t = QString::number(f / 1e6, 'f', dec);
+                const int tw = p.fontMetrics().horizontalAdvance(t);
+                p.drawText(QPointF(qBound(0.0, x - tw / 2.0, double(width() - tw)), height() - 4), t);
+            }
+        }
+        // hover readout / status
+        p.setPen(QColor(255, 255, 160));
+        QString top = status;
+        if (top.isEmpty() && span > 0) {
+            top = QString("%1 kHz span%2").arg(span / 1000.0, 0, 'g', 4).arg(fixedEdge ? " (fixed)" : "");
+            if (hoverX >= 0) top += QString("   cursor %1 MHz").arg(freqAt(hoverX) / 1e6, 0, 'f', 4);
+            if (clickToTune) top += (canTune && !canTune()) ? "   (tuning disabled while TX)" : "   click to tune";
+        }
+        p.drawText(rect().adjusted(6, 4, -6, 0), Qt::AlignTop | Qt::AlignLeft, top);
+        if (hoverX >= 0 && span > 0 && status.isEmpty()) {
+            p.setPen(QPen(QColor(255, 255, 255, 110), 1, Qt::DashLine));
+            p.drawLine(QPointF(hoverX, area.top()), QPointF(hoverX, area.bottom()));
+        }
+    }
+    void mouseMoveEvent(QMouseEvent *e) override { hoverX = e->position().x(); update(); }
+    void leaveEvent(QEvent *) override { hoverX = -1; update(); }
+    void mousePressEvent(QMouseEvent *e) override { if (e->button() == Qt::LeftButton) pressPos = e->position(); }
+    void mouseReleaseEvent(QMouseEvent *e) override {
+        // Only a deliberate left click (no drag) in the scope tunes, and never while transmitting.
+        if (e->button() != Qt::LeftButton || !clickToTune || span <= 0 || !status.isEmpty()) return;
+        if ((e->position() - pressPos).manhattanLength() > 6) return;
+        if (canTune && !canTune()) return;
+        double hz = freqAt(e->position().x());
+        const double res = span <= 20000 ? 10 : span <= 200000 ? 100 : 500;   // round to a sensible step
+        hz = std::round(hz / res) * res;
+        if (onTune && hz > 0) onTune(hz);
+    }
+
+private:
+    QTcpSocket sock; QTimer retry, stale; QString host; quint16 port = 7355; bool running = false;
+    QByteArray buf, spectrum; QImage wf; QString status = "connecting…";
+    QElapsedTimer lastData;
+    qint64 vfo = 0, startHz = 0, span = 0; int mode = -1; bool fixedEdge = false;
+    double lo = 20, hi = 160; double hoverX = -1; QPointF pressPos;
+    static constexpr int axisH = 18, WF_ROWS = 240;
+
+    void open() {
+        if (!running) return;
+        buf.clear(); sock.abort(); sock.connectToHost(host, port);
+    }
+    void lost(const QString &why) {
+        if (!running) return;
+        setStatus(QString("scope streamer %1:%2 — %3 (retrying)").arg(host).arg(port).arg(why));
+        if (!retry.isActive()) retry.start();
+    }
+    void setStatus(const QString &s) { if (status != s) { status = s; update(); } }
+    double xOf(double hz) const { return (hz - startHz) * width() / double(span); }
+    double freqAt(double x) const { return startHz + x * double(span) / qMax(1, width()); }
+    static double niceStep(double raw) {
+        const double p10 = std::pow(10.0, std::floor(std::log10(qMax(raw, 1.0))));
+        for (double m : {1.0, 2.0, 5.0, 10.0}) if (m * p10 >= raw) return m * p10;
+        return 10 * p10;
+    }
+    // Approximate receive passband relative to the VFO (Hz), from the mode byte in the frame.
+    // 0 LSB 1 USB 2 CW-L 3 CW-U 4 AM 5 AM-N 6 FM 7 FM-N 8 DATA-L 9 DATA-U A DATA-FM B DATA-FM-N C RTTY-L D RTTY-U E PSK
+    std::pair<double, double> passband() const {
+        switch (mode) {
+            case 0: case 8: return {-2700, -300};
+            case 1: case 9: case 0xE: return {300, 2700};
+            case 2: case 3: case 0xC: case 0xD: return {-250, 250};
+            case 4: return {-3000, 3000};
+            case 5: return {-2000, 2000};
+            case 6: case 0xA: return {-6000, 6000};
+            case 7: case 0xB: return {-3000, 3000};
+            default: return {0, 0};
+        }
+    }
+    void readData() {
+        buf += sock.readAll();
+        static const int H = 50;
+        while (buf.size() >= H) {
+            const uchar *d = reinterpret_cast<const uchar *>(buf.constData());
+            if (memcmp(d, "F7SC", 4) != 0 || d[4] != 1) { lost("bad stream header"); sock.abort(); return; }
+            const int hdr = d[5]; quint16 nb; quint16 ml;
+            memcpy(&nb, d + 6, 2); memcpy(&ml, d + 48, 2);
+            const int total = hdr + ml + nb;
+            if (buf.size() < total) break;
+            quint64 v, st; quint32 sp; memcpy(&v, d + 20, 8); memcpy(&st, d + 28, 8); memcpy(&sp, d + 36, 4);
+            const uchar flags = d[40];
+            if (flags & 0x80) setStatus("radio scope not streaming (radio off, SCU-LAN10 OFF, or no USB permission on the rig host)");
+            else if ((flags & 1) && nb > 0 && d[42] != lastSpanCode) { lastSpanCode = d[42]; if (onSpanCode) onSpanCode(d[42]); }
+            if (!(flags & 0x80) && (flags & 1) && nb > 0) frame(qint64(v), qint64(st), qint64(sp), d[41], flags & 2, buf.mid(hdr + ml, nb));
+            buf.remove(0, total);
+        }
+    }
+    void frame(qint64 v, qint64 st, qint64 sp, int md, bool fixed, const QByteArray &bins) {
+        lastData.start();
+        if (!status.isEmpty()) status.clear();
+        if (st != startHz || sp != span || wf.width() != bins.size()) {   // new view: start a fresh waterfall
+            wf = QImage(bins.size(), WF_ROWS, QImage::Format_RGB32); wf.fill(QColor(0, 0, 40));
+        }
+        vfo = v; startHz = st; span = sp; mode = md; fixedEdge = fixed; spectrum = bins;
+        // adaptive range: noise floor (20th percentile) and peak, smoothed
+        QByteArray s = bins; std::sort(s.begin(), s.end(), [](char a, char b) { return uchar(a) < uchar(b); });
+        const double floor = uchar(s[s.size() / 5]), peak = uchar(s[s.size() - 1 - s.size() / 200]);
+        if (autoContrast) {
+            lo = lo * 0.95 + (floor - 4) * 0.05;
+            hi = hi * 0.95 + qMax(peak, floor + 40) * 0.05;
+        } else { lo = 20; hi = 160; }   // fixed: radio scope LEVEL moves the data ~2 counts/dB (measured)
+        // scroll down one row, draw the new row on top
+        const int bpl = wf.bytesPerLine();
+        memmove(wf.bits() + bpl, wf.bits(), size_t(bpl) * (wf.height() - 1));
+        auto *row = reinterpret_cast<QRgb *>(wf.scanLine(0));
+        for (int i = 0; i < bins.size(); ++i) row[i] = color(uchar(bins[i]));
+        update();
+    }
+    QRgb color(int x) const {   // dark blue -> cyan -> yellow -> red
+        const double t = qBound(0.0, (x - lo) / qMax(1.0, hi - lo), 1.0);
+        static const double P[4][4] = {{0, 0, 0, 40}, {0.35, 0, 120, 200}, {0.65, 230, 230, 0}, {1, 255, 30, 0}};
+        for (int k = 0; k < 3; ++k)
+            if (t <= P[k + 1][0]) {
+                const double u = (t - P[k][0]) / (P[k + 1][0] - P[k][0]);
+                return qRgb(int(P[k][1] + (P[k + 1][1] - P[k][1]) * u), int(P[k][2] + (P[k + 1][2] - P[k][2]) * u),
+                            int(P[k][3] + (P[k + 1][3] - P[k][3]) * u));
+            }
+        return qRgb(255, 30, 0);
+    }
+};
+
+class Main : public QWidget {
+public:
+    Main() {
+        updateTitle();
+        auto *v = new QVBoxLayout(this);
+
+        // Connection row
+        auto *row = new QHBoxLayout;
+        connectBtn = new QPushButton("Connect");
+        disconnectBtn = new QPushButton("Disconnect…");
+        disconnectBtn->setToolTip("Stops talking and brings Mumble to the front. Mumble 1.4 has no remote "
+                                  "disconnect/quit, so use Server > Disconnect or Quit in Mumble itself, "
+                                  "so it saves its settings.");
+        mumbleLbl = new QLabel;
+        row->addWidget(connectBtn); row->addWidget(disconnectBtn); row->addWidget(mumbleLbl, 1);
+        v->addLayout(row);
+        startMinChk = new QCheckBox("Start Mumble minimized");
+        startMinChk->setToolTip("When Connect has to start Mumble, start it minimized to its top-bar tray icon "
+                                "(runs Mumble via XWayland so it can be minimized). Click the tray icon, or "
+                                "Disconnect…, to show it. Has no effect if Mumble is already running or you start it yourself.");
+        startMinChk->setChecked(cfg.startMinimized);
+        connect(startMinChk, &QCheckBox::toggled, this, [](bool on) { cfg.startMinimized = on; QSettings().setValue("startMumbleMinimized", on); });
+        v->addWidget(startMinChk);
+
+        // PTT
+        ptt = new QPushButton("PTT\n(hold, or hold Space)");
+        ptt->setMinimumHeight(140);
+        QFont f = ptt->font(); f.setPointSize(f.pointSize() + 10); f.setBold(true); ptt->setFont(f);
+        v->addWidget(ptt);
+
+        // RX volume: Mumble's playback stream on this computer (PipeWire/Pulse sink-input), same as the
+        // per-app slider in GNOME sound settings. Never touches the radio or the master volume.
+        auto *volRow = new QHBoxLayout;
+        volRow->addWidget(new QLabel("RX volume (Mumble):"));
+        volSlider = new QSlider(Qt::Horizontal);
+        volSlider->setRange(0, 150); volSlider->setPageStep(5); volSlider->setSingleStep(1);
+        volSlider->setTickPosition(QSlider::TicksBelow); volSlider->setTickInterval(25);
+        volLbl = new QLabel("—"); volLbl->setMinimumWidth(volLbl->fontMetrics().horizontalAdvance("150%  "));
+        muteBtn = new QToolButton; muteBtn->setText("Mute"); muteBtn->setCheckable(true);
+        volRow->addWidget(volSlider, 1); volRow->addWidget(volLbl); volRow->addWidget(muteBtn);
+        v->addLayout(volRow);
+        setVolEnabled(false);
+
+        // TX level: gain the bridge on the rig host applies to Mumble audio before it plays it into the FT-710
+        // USB input (~/.config/radio-bridge/tx_gain, linear factor = (slider%/100)^3, same curve as a
+        // PulseAudio volume). Works whether or not the bridge's TX stream exists, and survives restarts.
+        auto *txRow = new QHBoxLayout;
+        txRow->addWidget(new QLabel("TX level (to radio):"));
+        txSlider = new QSlider(Qt::Horizontal);
+        txSlider->setRange(0, 150); txSlider->setPageStep(5); txSlider->setSingleStep(1);
+        txSlider->setTickPosition(QSlider::TicksBelow); txSlider->setTickInterval(25);
+        txLbl = new QLabel("—"); txLbl->setMinimumWidth(txLbl->fontMetrics().horizontalAdvance("150%  "));
+        txResetBtn = new QToolButton; txResetBtn->setText("100%");
+        txRow->addWidget(txSlider, 1); txRow->addWidget(txLbl); txRow->addWidget(txResetBtn);
+        v->addLayout(txRow);
+        // Keep both rows' labels the same width so the sliders line up.
+        { QLabel *a = qobject_cast<QLabel *>(volRow->itemAt(0)->widget()), *b = qobject_cast<QLabel *>(txRow->itemAt(0)->widget());
+          int w = qMax(a->sizeHint().width(), b->sizeHint().width()); a->setMinimumWidth(w); b->setMinimumWidth(w);
+          int bw = qMax(muteBtn->sizeHint().width(), txResetBtn->sizeHint().width()); muteBtn->setMinimumWidth(bw); txResetBtn->setMinimumWidth(bw); }
+        setTxEnabled(false);
+        txApply.setSingleShot(true); txApply.setInterval(150);   // coalesce slider drags (one ssh per settle)
+        connect(&txApply, &QTimer::timeout, this, [this] { applyTx(txSlider->value()); });
+        connect(txSlider, &QSlider::valueChanged, this, [this](int val) {
+            txLbl->setText(QString("%1%").arg(val));
+            if (txSync) return;
+            txTouched.start();
+            txApply.start();
+        });
+        connect(txResetBtn, &QToolButton::clicked, this, [this] { txSlider->setValue(100); });
+
+        // Band scope (spectrum + waterfall from the radio, via the ft710-scope streamer on the rig host)
+        auto *scopeRow = new QHBoxLayout;
+        scopeChk = new QCheckBox("Show band scope");
+        scopeChk->setToolTip("Spectrum + waterfall from the FT-710's own scope (needs MENU SCU-LAN10 = ON and the "
+                             "ft710-scope service on the rig host, see Settings). Receive-only display.");
+        scopeTuneChk = new QCheckBox("Click to tune");
+        scopeTuneChk->setToolTip("A single left click in the scope sets VFO-A to that frequency through flrig "
+                                 "(rig.set_vfo). Disabled while transmitting. Never keys the radio.");
+        scopeRow->addWidget(scopeChk); scopeRow->addWidget(scopeTuneChk); scopeRow->addStretch(1);
+        v->addLayout(scopeRow);
+        // Scope SPAN and LEVEL on the radio (CAT SS05 / SS04 via flrig rig.cat_string: display settings only)
+        scopeCtl = new QWidget;
+        auto *sc = new QHBoxLayout(scopeCtl); sc->setContentsMargins(0, 0, 0, 0);
+        spanBox = new QComboBox;
+        for (const char *t : {"1 kHz", "2 kHz", "5 kHz", "10 kHz", "20 kHz", "50 kHz", "100 kHz", "200 kHz", "500 kHz", "1 MHz"})
+            spanBox->addItem(t);
+        spanBox->setCurrentIndex(-1);
+        spanBox->setToolTip("Scope span on the radio (CAT SS05). Current value comes from the scope stream.");
+        lvlSlider = new QSlider(Qt::Horizontal); lvlSlider->setRange(-60, 60); lvlSlider->setSingleStep(1); lvlSlider->setPageStep(10);
+        lvlSlider->setToolTip("Scope LEVEL on the radio, -30.0 to +30.0 dB in 0.5 dB steps (CAT SS04). Raises/lowers the "
+                              "whole scope and waterfall intensity. Double-click the value to re-read it from the radio.");
+        lvlSlider->setMinimumWidth(160); lvlSlider->setEnabled(false);
+        lvlLbl = new QLabel("…"); lvlLbl->setMinimumWidth(64);
+        autoChk = new QCheckBox("Auto contrast");
+        autoChk->setToolTip("Off: fixed colours, so the radio's LEVEL setting changes what you see. On: the app "
+                            "rescales colours to the noise floor and peaks (LEVEL then has little visible effect).");
+        sc->addWidget(new QLabel("Span")); sc->addWidget(spanBox); sc->addSpacing(12);
+        sc->addWidget(new QLabel("Level")); sc->addWidget(lvlSlider, 1); sc->addWidget(lvlLbl); sc->addSpacing(12);
+        sc->addWidget(autoChk);
+        v->addWidget(scopeCtl);
+        scope = new ScopeWidget;
+        v->addWidget(scope, 1);
+        scope->canTune = [this] { return radioRx && !talking && !holdTimer.isActive(); };
+        scope->onTune = [this](double hz) { tuneTo(hz); };
+        scope->onSpanCode = [this](int c) {
+            if (c < 0 || c > 9 || (spanTouched.isValid() && spanTouched.elapsed() < 3000)) return;
+            QSignalBlocker b(spanBox); spanBox->setCurrentIndex(c);
+        };
+        connect(spanBox, qOverload<int>(&QComboBox::activated), this, [this](int c) {
+            if (c < 0 || c > 9) return;
+            spanTouched.start();
+            scopeCat(QString("SS05%1").arg(c) + "0000;");
+        });
+        geomSave.setSingleShot(true); geomSave.setInterval(600);   // debounced size save (survives a kill)
+        connect(&geomSave, &QTimer::timeout, this, [this] { saveGeom(); });
+        lvlApply.setSingleShot(true); lvlApply.setInterval(300);   // debounce slider drags: one set per settle
+        connect(&lvlApply, &QTimer::timeout, this, [this] { scopeCat(levelCmd(lvlSlider->value())); });
+        connect(lvlSlider, &QSlider::valueChanged, this, [this](int h) {
+            lvlLbl->setText(QString("%1 dB").arg(h / 2.0, 0, 'f', 1));
+            if (lvlSync) return;
+            lvlTouched.start(); lvlApply.start();
+        });
+        connect(&lvlPoll, &QTimer::timeout, this, [this] { queryLevel(); });
+        lvlPoll.setInterval(15000);
+        {
+            const bool ac = QSettings().value("scopeAutoContrast", false).toBool();
+            autoChk->setChecked(ac); scope->autoContrast = ac;
+        }
+        connect(autoChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("scopeAutoContrast", on); scope->autoContrast = on; });
+        {
+            QSettings st;
+            scopeTuneChk->setChecked(st.value("scopeClickTune", true).toBool());
+            scope->clickToTune = scopeTuneChk->isChecked();
+            scopeChk->setChecked(st.value("showScope", true).toBool());
+        }
+        connect(scopeTuneChk, &QCheckBox::toggled, this, [this](bool on) {
+            QSettings().setValue("scopeClickTune", on); scope->clickToTune = on; scope->update();
+        });
+        connect(scopeChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("showScope", on); showScope(on); });
+        showScope(scopeChk->isChecked());
+
+        // Status
+        statusBox = new QGroupBox; auto *box = statusBox;
+        auto *g = new QFormLayout(box);
+        for (auto *l : {&murmurLbl, &bridgeLbl, &connLbl, &rxLbl, &txEnLbl, &pttLbl, &vfoLbl}) *l = new QLabel("…");
+        QFont big = pttLbl->font(); big.setBold(true); big.setPointSize(big.pointSize() + 4);
+        pttLbl->setFont(big); vfoLbl->setFont(big);
+        g->addRow("Mumble server (murmur):", murmurLbl);
+        g->addRow("radio-bridge service:", bridgeLbl);
+        g->addRow("Bridge ↔ Mumble:", connLbl);
+        g->addRow("RX frames sent:", rxLbl);
+        g->addRow("TX keying:", txEnLbl);
+        g->addRow("Radio PTT (flrig):", pttLbl);
+        g->addRow("VFO:", vfoLbl);
+        v->addWidget(box);
+
+        auto *row2 = new QHBoxLayout;
+        txBtn = new QPushButton("…");
+        restartBtn = new QPushButton("Restart bridge");
+        auto *helpBtn = new QPushButton("Help / About");
+        settingsBtn = new QPushButton("Settings…");
+        settingsBtn->setToolTip("Rig host, flrig, Mumble server and band-scope settings.");
+        logBtn = new QToolButton; logBtn->setText("Show log"); logBtn->setCheckable(true);
+        row2->addWidget(txBtn, 1); row2->addWidget(restartBtn); row2->addWidget(logBtn); row2->addWidget(settingsBtn); row2->addWidget(helpBtn);
+        v->addLayout(row2);
+
+        log = new QPlainTextEdit; log->setReadOnly(true); log->setVisible(false);
+        log->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        log->setMinimumHeight(220);
+        v->addWidget(log);
+
+        for (auto *b : findChildren<QAbstractButton *>()) b->setFocusPolicy(Qt::NoFocus);
+        log->setFocusPolicy(Qt::NoFocus);
+
+        connect(connectBtn, &QPushButton::clicked, this, [this] { doConnect(); });
+        connect(disconnectBtn, &QPushButton::clicked, this, [this] { doDisconnect(); });
+        connect(ptt, &QPushButton::pressed, this, [this] { pressPtt(); });
+        connect(ptt, &QPushButton::released, this, [this] { stopTalk(); });
+        connect(txBtn, &QPushButton::clicked, this, [this] { toggleTx(); });
+        connect(restartBtn, &QPushButton::clicked, this, [this] {
+            stopTalk();
+            if (QMessageBox::question(this, "Restart bridge", QString("Restart %1 on %2?").arg(cfg.bridgeService, cfg.rigName())) == QMessageBox::Yes) {
+                bool ok; sshRun("systemctl --user restart " + shq(cfg.bridgeService), &ok);
+                if (!ok) QMessageBox::warning(this, "Restart bridge", "Restart failed.");
+                poll();
+            }
+        });
+        connect(logBtn, &QToolButton::toggled, this, [this](bool on) {
+            log->setVisible(on); logBtn->setText(on ? "Hide log" : "Show log");
+            if (on) poll();
+            else if (!restoreSavedGeometry()) adjustSize();   // back to the remembered size
+        });
+        connect(helpBtn, &QPushButton::clicked, this, [this] { showHelp(); });
+        connect(settingsBtn, &QPushButton::clicked, this, [this] { editSettings(); });
+
+        volApply.setSingleShot(true); volApply.setInterval(60);   // coalesce slider drags
+        connect(&volApply, &QTimer::timeout, this, [this] { applyVolume(volSlider->value()); });
+        connect(volSlider, &QSlider::valueChanged, this, [this](int val) {
+            volLbl->setText(QString("%1%").arg(val));
+            if (volSync) return;           // programmatic update from polling
+            volTouched.start();
+            volApply.start();
+        });
+        connect(muteBtn, &QToolButton::toggled, this, [this](bool on) {
+            muteBtn->setText(on ? "Muted" : "Mute");
+            muteBtn->setStyleSheet(on ? "background:#c00; color:white;" : "");
+            if (volSync) return;
+            volTouched.start();
+            for (int idx : volStreams) runPactl({"set-sink-input-mute", QString::number(idx), on ? "1" : "0"});
+        });
+        volTimer.setInterval(2000);
+        connect(&volTimer, &QTimer::timeout, this, [this] { pollVolume(); });
+        volTimer.start();
+        pollVolume();
+
+        qApp->installEventFilter(this);
+        connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { stopTalk(true); });
+
+        timer.setInterval(POLL_IDLE_MS);
+        connect(&timer, &QTimer::timeout, this, [this] { poll(); adjustPollRate(); });
+        // PTT debounce: only start talking if PTT is still held after PTT_MIN_HOLD_MS.
+        holdTimer.setSingleShot(true); holdTimer.setInterval(PTT_MIN_HOLD_MS);
+        connect(&holdTimer, &QTimer::timeout, this, [this] { beginTalk(); });
+        // Retry stoptalking until Mumble acknowledges it (extra stops are harmless: Mumble
+        // only decrements its PTT count while it is > 0).
+        stopRetry.setInterval(250);
+        connect(&stopRetry, &QTimer::timeout, this, [this] {
+            if (mumbleRpc("self", {{"stoptalking", "stoptalking"}})) { stopRetry.stop(); stopTries = 0; updatePttWarn(false); return; }
+            if (++stopTries >= 8) { stopRetry.stop(); stopTries = 0; updatePttWarn(true); }
+        });
+        timer.start();
+        applyConfig();
+        if (!cfg.configured()) QTimer::singleShot(300, this, [this] { editSettings(); });
+    }
+
+    ~Main() override {
+        qApp->removeEventFilter(this);
+        timer.stop();
+        if (pollProc) { pollProc->disconnect(); pollProc->kill(); pollProc->waitForFinished(1000); }
+        volTimer.stop();
+        if (volProc) { volProc->disconnect(); volProc->kill(); volProc->waitForFinished(1000); }
+    }
+
+protected:
+    bool eventFilter(QObject *o, QEvent *e) override {
+        if (e->type() == QEvent::KeyPress || e->type() == QEvent::KeyRelease) {
+            auto *k = static_cast<QKeyEvent *>(e);
+            if (k->key() == Qt::Key_Space && isActiveWindow() && !QApplication::activeModalWidget()) {
+                if (!k->isAutoRepeat()) {
+                    if (e->type() == QEvent::KeyPress) pressPtt(); else stopTalk();
+                }
+                return true;
+            }
+        } else if (e->type() == QEvent::MouseButtonRelease && (talking || holdTimer.isActive()) && !QApplication::activeModalWidget()) {
+            // Release anywhere (even dragged off the button) ends TX.
+            QTimer::singleShot(0, this, [this] { if (!ptt->isDown()) stopTalk(); });
+        }
+        return QWidget::eventFilter(o, e);
+    }
+    void changeEvent(QEvent *e) override {
+        if (e->type() == QEvent::ActivationChange && !isActiveWindow()) stopTalk();
+        QWidget::changeEvent(e);
+    }
+    void closeEvent(QCloseEvent *e) override { stopTalk(true); geomSave.stop(); saveGeom(); QWidget::closeEvent(e); }
+    void resizeEvent(QResizeEvent *e) override { QWidget::resizeEvent(e); if (geomReady) geomSave.start(); }
+    void moveEvent(QMoveEvent *e) override { QWidget::moveEvent(e); if (geomReady) geomSave.start(); }
+public:
+    // Window size memory (QSettings file, see Settings > General), kept separately for scope shown / hidden.
+    // Not saved while the log pane is open (that size is temporary). On Wayland only the size comes back;
+    // the compositor places the window.
+    bool restoreSavedGeometry() {
+        const QByteArray g = QSettings().value(geomKey(scopeChk->isChecked())).toByteArray();
+        return !g.isEmpty() && restoreGeometry(g);
+    }
+    void enableGeometrySaving() { geomReady = true; }
+private:
+    QTimer geomSave; bool geomReady = false;
+    static QString geomKey(bool scopeShown) { return scopeShown ? "geometry/scopeShown" : "geometry/scopeHidden"; }
+    void saveGeom(int scopeState = -1) {
+        if (!geomReady || !isVisible() || log->isVisible()) return;
+        QSettings().setValue(geomKey(scopeState < 0 ? scopeChk->isChecked() : scopeState == 1), saveGeometry());
+    }
+
+private:
+    QPushButton *connectBtn, *disconnectBtn, *ptt, *txBtn, *restartBtn;
+    // --- band scope ---
+    QCheckBox *scopeChk, *scopeTuneChk;
+    ScopeWidget *scope;
+    bool radioRx = false;          // flrig last reported PTT=0 (tuning by click is only allowed then)
+    QProcess *tuneProc = nullptr;
+    // scope span/level controls
+    QWidget *scopeCtl; QComboBox *spanBox; QSlider *lvlSlider; QLabel *lvlLbl; QCheckBox *autoChk;
+    QTimer lvlApply, lvlPoll; QElapsedTimer lvlTouched, spanTouched; bool lvlSync = false;
+    QProcess *catProc = nullptr; QString catPending; int lvlRetries = 0;
+    // The only CAT strings this app ever sends: "SS05<0-9>0000;" (span) and "SS04<+|-><00.0-30.0>;" (level)
+    // and the queries "SS04;". Anything else is refused here.
+    static bool scopeCmdOk(const QString &c) {
+        static const QRegularExpression ok("^(SS05[0-9]0000;|SS04[+-](30\\.0|[0-2][0-9]\\.[05]);|SS04;)$");
+        return ok.match(c).hasMatch();
+    }
+    static QString levelCmd(int half) {   // half-dB units -60..60
+        half = qBound(-60, half, 60);
+        return QString("SS04%1%2;").arg(half < 0 ? '-' : '+').arg(std::abs(half) / 2.0, 4, 'f', 1, QChar('0'));
+    }
+    static QString catXml(const QString &cmd) {   // flrig rig.cat_string wants each byte as "xHH"
+        QString hx;
+        for (QChar ch : cmd) hx += "x" + QString("%1").arg(ch.unicode() & 0xFF, 2, 16, QChar('0')).toUpper();
+        return "<?xml version=\"1.0\"?><methodCall><methodName>rig.cat_string</methodName><params><param><value>"
+               + hx + "</value></param></params></methodCall>";
+    }
+    static QString catReply(const QString &xml) {   // " 53 53 30 34 ..." -> "SS04..."
+        static const QRegularExpression v("<value>(?:<string>)?([^<]*)");
+        auto m = v.match(xml); if (!m.hasMatch()) return {};
+        QString out;
+        for (const QString &t : m.captured(1).split(' ', Qt::SkipEmptyParts)) { bool ok; int b = t.toInt(&ok, 16); if (!ok) return {}; out += QChar(b); }
+        return out;
+    }
+    // One CAT exchange via ssh + curl -> flrig on the rig host (flrig owns the serial port and serialises access).
+    void scopeCat(const QString &cmd) {
+        if (!scopeCmdOk(cmd)) { QTextStream(stderr) << "refused CAT " << cmd << Qt::endl; return; }
+        if (catProc) { catPending = cmd; return; }   // send the newest value when the current one finishes
+        catProc = new QProcess(this);
+        connect(catProc, &QProcess::finished, this, [this, cmd](int code, QProcess::ExitStatus st) {
+            const QString out = QString::fromUtf8(catProc->readAllStandardOutput());
+            catProc->deleteLater(); catProc = nullptr;
+            if (st == QProcess::NormalExit && code == 0 && cmd == "SS04;") gotLevel(catReply(out));
+            if (!catPending.isEmpty()) { const QString c = catPending; catPending.clear(); scopeCat(c); }
+            else if (cmd.startsWith("SS04") && cmd != "SS04;") QTimer::singleShot(800, this, [this] { queryLevel(); });
+        });
+        connect(catProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            if (e == QProcess::FailedToStart && catProc) { catProc->deleteLater(); catProc = nullptr; }
+        });
+        catProc->start("ssh", sshArgs("curl -s -m 3 -H 'Content-Type: text/xml' --data-binary @- " + shq(cfg.flrigUrl())));
+        catProc->write(catXml(cmd).toUtf8()); catProc->closeWriteChannel();
+        QTimer::singleShot(8000, catProc, [p = catProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+    }
+    void queryLevel() {
+        if (!scope->isVisible() || (lvlTouched.isValid() && lvlTouched.elapsed() < 3000)) return;
+        scopeCat("SS04;");
+    }
+    void gotLevel(const QString &r) {
+        // flrig can hand back a reply meant for its own polling; accept only a well-formed SS04 answer
+        static const QRegularExpression re("SS04([+-]\\d\\d\\.\\d);");
+        auto m = re.match(r);
+        if (!m.hasMatch()) { if (++lvlRetries <= 3) QTimer::singleShot(700, this, [this] { queryLevel(); }); return; }
+        lvlRetries = 0;
+        if (lvlTouched.isValid() && lvlTouched.elapsed() < 3000) return;
+        const int half = int(std::lround(m.captured(1).toDouble() * 2));
+        lvlSync = true; lvlSlider->setValue(half); lvlSync = false;
+        lvlLbl->setText(QString("%1 dB").arg(half / 2.0, 0, 'f', 1));
+        lvlSlider->setEnabled(true);
+    }
+    void showScope(bool on) {
+        if (geomReady) { geomSave.stop(); saveGeom(on ? 0 : 1); }   // remember the size for the state we're leaving
+        const bool remembered = geomReady && !QSettings().value(geomKey(on)).toByteArray().isEmpty();
+        scope->setVisible(on); scopeTuneChk->setVisible(on); scopeCtl->setVisible(on);
+        if (remembered) QTimer::singleShot(0, this, [this] { restoreSavedGeometry(); });
+        if (on) { queryLevel(); lvlPoll.start(); } else lvlPoll.stop();
+        if (on) {
+            if (cfg.effScopeHost().isEmpty()) scope->stop(); else scope->start(cfg.effScopeHost(), quint16(cfg.scopePort));
+            if (!remembered && width() < 760) resize(760, qMax(height(), 820));
+        } else {
+            scope->stop();
+            if (!remembered) QTimer::singleShot(0, this, [this] { adjustSize(); });
+        }
+    }
+    // Click-to-tune: flrig rig.set_vfo on the rig host (frequency only; never PTT, never menu/EX settings).
+    void tuneTo(double hz) {
+        if (tuneProc || !radioRx || talking || hz < 30e3 || hz > 75e6) return;
+        const QString body = QString("<?xml version=\"1.0\"?><methodCall><methodName>rig.set_vfo</methodName><params><param>"
+                                     "<value><double>%1</double></value></param></params></methodCall>").arg(hz, 0, 'f', 0);
+        tuneProc = new QProcess(this);
+        connect(tuneProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
+            if (st != QProcess::NormalExit || code != 0) QTextStream(stderr) << "rig.set_vfo failed" << Qt::endl;
+            tuneProc->deleteLater(); tuneProc = nullptr; poll();
+        });
+        connect(tuneProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            if (e == QProcess::FailedToStart && tuneProc) { tuneProc->deleteLater(); tuneProc = nullptr; }
+        });
+        tuneProc->start("ssh", sshArgs("curl -s -m 3 -H 'Content-Type: text/xml' --data-binary @- " + shq(cfg.flrigUrl()) + " >/dev/null"));
+        tuneProc->write(body.toUtf8()); tuneProc->closeWriteChannel();
+        QTimer::singleShot(8000, tuneProc, [p = tuneProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+    }
+    QCheckBox *startMinChk;
+    QTimer *minTimer = nullptr;
+
+    // After launching Mumble (under XWayland) minimize each of its main windows once, as soon as it maps.
+    void minimizeMumbleWhenShown(qint64 pid) {
+        if (minTimer) { minTimer->stop(); minTimer->deleteLater(); }
+        minTimer = new QTimer(this); minTimer->setInterval(100);
+        auto done = std::make_shared<QSet<xcb_window_t>>();
+        auto clock = std::make_shared<QElapsedTimer>(); clock->start();
+        auto firstHit = std::make_shared<qint64>(-1);
+        connect(minTimer, &QTimer::timeout, this, [this, pid, done, clock, firstHit] {
+            x11::Conn x;
+            for (xcb_window_t w : x.mumbleWindows(pid, true))
+                if (!done->contains(w)) {
+                    done->insert(w); x.iconify(w);
+                    if (*firstHit < 0) *firstHit = clock->elapsed();
+                    QTextStream(stderr) << "start-minimized: iconified window 0x" << Qt::hex << w << Qt::dec
+                                        << " at " << clock->elapsed() << " ms" << Qt::endl;
+                }
+            // Watch 15 s at most, or 3 s after the main window was minimized (catches late extra windows).
+            if (clock->elapsed() > 15000 || (*firstHit >= 0 && clock->elapsed() > *firstHit + 3000)) {
+                minTimer->stop(); minTimer->deleteLater(); minTimer = nullptr;
+            }
+        });
+        minTimer->start();
+    }
+    // Bring Mumble to the front: RPC focus (show+raise), plus un-minimize it if it's an XWayland window.
+    void raiseMumble() {
+        mumbleRpc("focus", {});
+        QTimer::singleShot(150, this, [] { x11::Conn x; for (xcb_window_t w : x.mumbleWindows(0, false)) x.activate(w); });
+    }
+    QToolButton *logBtn; QPushButton *settingsBtn; QGroupBox *statusBox;
+    QLabel *mumbleLbl, *murmurLbl, *bridgeLbl, *connLbl, *rxLbl, *txEnLbl, *pttLbl, *vfoLbl;
+    QPlainTextEdit *log;
+    QTimer timer;
+    QProcess *pollProc = nullptr;
+    bool talking = false;          // a starttalking was sent (acked or not) and no stop yet
+    static constexpr int POLL_IDLE_MS = 3000, POLL_TALK_MS = 500, PTT_MIN_HOLD_MS = 150;
+    QTimer holdTimer, stopRetry;
+    int stopTries = 0;
+    QElapsedTimer fastPollSince;   // keep fast polling briefly after release so the readout shows the unkey
+    QString txState = "unknown";
+
+    // --- RX volume (Mumble sink-input) ---
+    // --- TX level (bridge's playback stream on the rig host) ---
+    QSlider *txSlider; QLabel *txLbl; QToolButton *txResetBtn;
+    QTimer txApply;
+    QProcess *txProc = nullptr;
+    int txPending = -1;          // value queued while an ssh write is in flight
+    bool txSync = false;
+    QElapsedTimer txTouched;
+
+    static double pctToGain(int pct) { double v = qBound(0, pct, 150) / 100.0; return v * v * v; }
+    static int gainToPct(double g) { return int(std::lround(std::cbrt(qMax(0.0, g)) * 100.0)); }
+    void setTxEnabled(bool on) {
+        txSlider->setEnabled(on); txResetBtn->setEnabled(on);
+        const QString tip = on ? "Level of the Mumble audio the bridge on the rig host plays into the FT-710's USB input. "
+                                 "Lower it if you're driving the radio too hard; 100% = unchanged. Saved on the rig host "
+                                 "(~/.config/radio-bridge/tx_gain), so it survives bridge restarts. "
+                                 "Does not key the radio or change tx_enabled."
+                               : "The rig host isn't reachable right now.";
+        txSlider->setToolTip(tip); txLbl->setToolTip(tip); txResetBtn->setToolTip(tip);
+        if (!on) txLbl->setText("—");
+    }
+    void applyTx(int pct) {
+        pct = qBound(0, pct, 150);
+        QSettings().setValue("txVolume", pct);
+        if (txProc) { txPending = pct; return; }
+        txProc = new QProcess(this);
+        connect(txProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
+            if (st != QProcess::NormalExit || code != 0) QTextStream(stderr) << "tx_gain write failed" << Qt::endl;
+            txProc->deleteLater(); txProc = nullptr;
+            if (txPending >= 0) { int p = txPending; txPending = -1; applyTx(p); }
+        });
+        connect(txProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            if (e == QProcess::FailedToStart && txProc) { txProc->deleteLater(); txProc = nullptr; }
+        });
+        // Atomic replace, so the bridge never reads a half-written file.
+        const QString g = QString::number(pctToGain(pct), 'f', 6);
+        txProc->start("ssh", sshArgs(QString("f=%1; echo %2 > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\"").arg(cfg.remoteFile("tx_gain")).arg(g)));
+        QTimer::singleShot(8000, txProc, [p = txProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+    }
+    void parseTx(const QString &val) {   // file contents, "none" if absent, empty if the poll failed
+        const QString v = val.trimmed();
+        if (v.isEmpty()) { setTxEnabled(false); return; }
+        setTxEnabled(true);
+        bool ok = false; double g = v.toDouble(&ok);
+        const int pct = (v == "none" || !ok) ? 100 : qBound(0, gainToPct(g), 150);   // bridge default is 1.0
+        if (txProc || txApply.isActive()) return;
+        if (txTouched.isValid() && txTouched.elapsed() < 2500) return;
+        if (txSlider->isSliderDown()) return;
+        txSync = true;
+        txSlider->setValue(pct);
+        txLbl->setText(QString("%1%").arg(pct));
+        txSync = false;
+        QSettings st;
+        if (st.value("txVolume", -1).toInt() != pct) st.setValue("txVolume", pct);
+    }
+public:
+    void setTxForTest(int pct) { txSlider->setValue(pct); }
+    int txForTest() const { return txSlider->value(); }
+    bool txEnabledForTest() const { return txSlider->isEnabled(); }
+private:
+    QSlider *volSlider; QLabel *volLbl; QToolButton *muteBtn;
+    QTimer volTimer, volApply;
+    QProcess *volProc = nullptr;
+    QList<int> volStreams;       // current Mumble sink-input indexes
+    QSet<int> volSeen;           // streams already handled (saved volume applied or adopted)
+    bool volFirstPoll = true, volSync = false;
+    QElapsedTimer volTouched;    // last user interaction; polling won't overwrite the slider just after
+
+    void setVolEnabled(bool on) {
+        volSlider->setEnabled(on); muteBtn->setEnabled(on);
+        const QString tip = on ? "Volume of Mumble's playback on this computer (radio receive audio). "
+                                 "Does not change the FT-710 USB level or the master volume."
+                               : "Mumble's audio stream isn't present yet (Connect first). "
+                                 "The last volume is reapplied when it appears.";
+        volSlider->setToolTip(tip); muteBtn->setToolTip(tip); volLbl->setToolTip(tip);
+        if (!on) volLbl->setText("—");
+    }
+    void runPactl(const QStringList &args) {   // fire-and-forget, non-blocking
+        auto *p = new QProcess(this);
+        connect(p, &QProcess::finished, p, &QObject::deleteLater);
+        connect(p, &QProcess::errorOccurred, p, [p](QProcess::ProcessError e) { if (e == QProcess::FailedToStart) p->deleteLater(); });
+        p->start("pactl", args);
+    }
+    void applyVolume(int pct, int onlyIdx = -1) {
+        QSettings().setValue("rxVolume", pct);
+        for (int idx : volStreams)
+            if (onlyIdx < 0 || idx == onlyIdx)
+                runPactl({"set-sink-input-volume", QString::number(idx), QString("%1%").arg(pct)});
+    }
+    void pollVolume() {
+        if (volProc) return;
+        volProc = new QProcess(this);
+        connect(volProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
+            QByteArray out = volProc->readAllStandardOutput();
+            volProc->deleteLater(); volProc = nullptr;
+            if (st == QProcess::NormalExit && code == 0) parseVolume(out);
+        });
+        connect(volProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+            if (volProc && volProc->state() == QProcess::NotRunning) { volProc->deleteLater(); volProc = nullptr; setVolEnabled(false); }
+        });
+        volProc->start("pactl", {"-f", "json", "list", "sink-inputs"});
+        QTimer::singleShot(3000, volProc, [p = volProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+    }
+    void parseVolume(const QByteArray &json) {
+        struct S { int idx, pct; bool mute; };
+        QList<S> found;
+        for (const QJsonValue &it : QJsonDocument::fromJson(json).array()) {
+            QJsonObject o = it.toObject(), pr = o["properties"].toObject();
+            const QString name = pr["application.name"].toString(), bin = pr["application.process.binary"].toString();
+            if (!name.contains("mumble", Qt::CaseInsensitive) && !bin.contains("mumble", Qt::CaseInsensitive)) continue;
+            QJsonObject vol = o["volume"].toObject();
+            double sum = 0; int n = 0;
+            for (auto c = vol.begin(); c != vol.end(); ++c) { sum += c.value().toObject()["value"].toDouble(); ++n; }
+            found.append({o["index"].toInt(), n ? int(std::lround(sum / n * 100.0 / 65536.0)) : 100, o["mute"].toBool()});
+        }
+        std::sort(found.begin(), found.end(), [](const S &a, const S &b) { return a.idx < b.idx; });
+        volStreams.clear();
+        for (auto &f : found) volStreams.append(f.idx);
+        const bool startup = volFirstPoll; volFirstPoll = false;
+        if (found.isEmpty()) { setVolEnabled(false); return; }
+        setVolEnabled(true);
+        QSettings st;
+        for (auto &f : found) {
+            if (volSeen.contains(f.idx)) continue;
+            volSeen.insert(f.idx);
+            // A stream that was already playing when the app started keeps its volume (adopted).
+            // A stream that appears later (Mumble (re)connected) gets the last chosen volume.
+            if (!startup && st.contains("rxVolume")) {
+                int want = st.value("rxVolume").toInt();
+                if (want != f.pct) { applyVolume(want, f.idx); f.pct = want; }
+            }
+        }
+        if (volTouched.isValid() && volTouched.elapsed() < 1500) return;   // user is adjusting
+        if (volSlider->isSliderDown()) return;
+        const S &m = found.first();
+        volSync = true;
+        volSlider->setValue(qBound(0, m.pct, 150));
+        volLbl->setText(QString("%1%").arg(m.pct));
+        muteBtn->setChecked(m.mute);
+        volSync = false;
+        if (st.value("rxVolume", -1).toInt() != m.pct) st.setValue("rxVolume", m.pct);   // follow external changes
+    }
+public:
+    void setVolumeForTest(int pct) { volSlider->setValue(pct); }   // same path as dragging the slider
+private:
+
+    // Press: arm the debounce timer; a release within PTT_MIN_HOLD_MS cancels without keying.
+    void pressPtt() {
+        if (talking || holdTimer.isActive()) return;
+        if (!mumbleRunning()) { ptt->setDown(false); mumbleLbl->setText("Mumble not running — Connect first"); return; }
+        ptt->setStyleSheet("background:#e90; color:black;");
+        ptt->setText("hold…");
+        holdTimer.start();
+    }
+    void startTalk() { beginTalk(); }   // immediate (used by the --ptt-test hook)
+    void beginTalk() {
+        holdTimer.stop();
+        if (talking) return;
+        if (!mumbleRunning()) { resetPttButton(); mumbleLbl->setText("Mumble not running — Connect first"); return; }
+        if (stopRetry.isActive()) {   // an earlier stop is still unacknowledged: try once more, then stop retrying
+            stopRetry.stop(); stopTries = 0;
+            mumbleRpc("self", {{"stoptalking", "stoptalking"}});
+        }
+        // Mark talking before sending: even if Mumble does not ack, it may have acted on the
+        // request, so the release must always send stoptalking.
+        talking = true;
+        bool ack = mumbleRpc("self", {{"starttalking", "starttalking"}});
+        ptt->setStyleSheet("background:#c00; color:white;");
+        ptt->setText(ack ? "TALKING" : "TALKING?\n(Mumble did not ack)");
+        adjustPollRate();
+        poll();
+    }
+    void stopTalk(bool force = false) {
+        if (holdTimer.isActive()) { holdTimer.stop(); resetPttButton(); return; }   // short tap: never keyed
+        if (talking) {
+            talking = false;
+            fastPollSince.start();
+            if (mumbleRpc("self", {{"stoptalking", "stoptalking"}})) updatePttWarn(false);
+            else {
+                if (force) {   // quitting: retry synchronously a few times
+                    for (int i = 0; i < 3 && !mumbleRpc("self", {{"stoptalking", "stoptalking"}}); ++i) waitMs(200);
+                } else { stopTries = 0; stopRetry.start(); }
+            }
+            adjustPollRate();
+        }
+        resetPttButton();
+    }
+    void resetPttButton() {
+        ptt->setDown(false);
+        ptt->setStyleSheet("");
+        ptt->setText("PTT\n(hold, or hold Space)");
+    }
+    void updatePttWarn(bool on) {
+        if (on) mumbleLbl->setText("WARNING: Mumble did not acknowledge stop-talking — check Mumble / radio PTT");
+        else if (mumbleLbl->text().startsWith("WARNING")) { mumbleLbl->setText(""); updateUi(); }
+    }
+    // Poll the status (incl. flrig PTT) every 0.5 s while talking and for 4 s after release, else 3 s.
+    void adjustPollRate() {
+        bool fast = talking || holdTimer.isActive() || stopRetry.isActive()
+                    || (fastPollSince.isValid() && fastPollSince.elapsed() < 4000);
+        int want = fast ? POLL_TALK_MS : POLL_IDLE_MS;
+        if (timer.interval() != want) timer.start(want);
+    }
+
+    // Push-to-Talk via Mumble's live D-Bus API (net.sourceforge.mumble.mumble), never by editing
+    // Mumble.conf, so Mumble's own saves are never clobbered. 0=Continuous 1=VAD 2=PTT.
+    void ensurePttMode() {
+        QDBusInterface m("net.sourceforge.mumble.mumble", "/", "net.sourceforge.mumble.Mumble");
+        QDBusReply<uint> mode;
+        for (int i = 0; i < 20; ++i) {
+            if (m.isValid()) { mode = m.call("getTransmitMode"); if (mode.isValid()) break; }
+            waitMs(250);
+        }
+        if (!mode.isValid()) {
+            QMessageBox::information(this, "Mumble transmit mode",
+                "Couldn't read Mumble's transmit mode. Please make sure Mumble is set to Push-to-Talk "
+                "(Settings > Audio Input > Transmission).");
+            return;
+        }
+        if (mode.value() == 2) return;
+        if (QMessageBox::question(this, "Mumble transmit mode",
+                "Mumble is not set to Push-to-Talk. In Voice Activity or Continuous mode your mic "
+                "could key the FT-710 whenever TX keying is on.\n\nSwitch Mumble to Push-to-Talk now?")
+            == QMessageBox::Yes) {
+            QDBusMessage r = m.call("setTransmitMode", uint(2));
+            if (r.type() == QDBusMessage::ErrorMessage)
+                QMessageBox::warning(this, "Mumble transmit mode",
+                    "Couldn't change it. Set Push-to-Talk in Mumble: Settings > Audio Input > Transmission.");
+        }
+    }
+
+    // Current Mumble server URL via D-Bus ("" when not connected / not reachable).
+    static QString mumbleCurrentUrl() {
+        QDBusInterface m("net.sourceforge.mumble.mumble", "/", "net.sourceforge.mumble.Mumble");
+        if (!m.isValid()) return {};
+        QDBusReply<QString> r = m.call("getCurrentUrl");
+        return r.isValid() ? r.value() : QString();
+    }
+    static void waitMs(int ms) { QElapsedTimer t; t.start(); while (t.elapsed() < ms) QApplication::processEvents(QEventLoop::AllEvents, 50); }
+
+public:
+    bool isConnectedToServer() {
+        if (cfg.effMumbleHost().isEmpty() || cfg.mumbleUser.isEmpty()) return false;
+        QUrl cur(mumbleCurrentUrl());
+        return cur.host().compare(cfg.effMumbleHost(), Qt::CaseInsensitive) == 0 && cur.userName() == cfg.mumbleUser;
+    }
+
+    // Connect Mumble to the configured server as the configured user (Settings > Mumble).
+    //  * Mumble not running: start it WITH the URL (no password in argv). That suppresses Mumble's
+    //    startup "Connect to server" dialog (which otherwise pops up and, if a server is picked there,
+    //    replaces our session). If you saved the server as a Mumble favorite with its password,
+    //    Mumble fills the password in itself.
+    //  * Additionally (and when Mumble is already running) send the full URL incl. password over
+    //    Mumble's local RPC socket, which connects immediately even while first-run wizards are open.
+    //    The password comes from the rig host (bridge's server.pw, over ssh) or the local settings,
+    //    per Settings > Mumble > Password; it never appears on a command line.
+    void doConnect() {
+        if (!cfg.configured() || cfg.mumbleUser.isEmpty()) {
+            QMessageBox::information(this, "Connect", "Set the rig host and your Mumble user name in Settings first.");
+            editSettings(); return;
+        }
+        QUrl u;
+        u.setScheme("mumble"); u.setHost(cfg.effMumbleHost()); u.setPort(cfg.mumblePort);
+        u.setUserName(cfg.mumbleUser); u.setPath("/" + cfg.mumbleChannel); u.setQuery("version=1.2.0");
+        if (mumbleRunning() && isConnectedToServer()) { mumbleLbl->setText(QString("Already connected as %1").arg(cfg.mumbleUser)); return; }
+        if (!mumbleRunning()) {
+            QProcess launcher;
+            launcher.setProgram("mumble");
+            launcher.setArguments({u.toString(QUrl::FullyEncoded)});
+            // Only use XWayland if we can actually reach it (DISPLAY + XAUTHORITY OK); otherwise a
+            // Qt xcb Mumble would fail to start, so fall back to a normal (Wayland) launch.
+            const bool minimized = startMinChk->isChecked() && !qEnvironmentVariableIsEmpty("DISPLAY") && x11::Conn().c;
+            if (minimized) {
+                QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+                env.insert("QT_QPA_PLATFORM", "xcb");   // XWayland, so the window can be minimized
+                env.remove("GDK_BACKEND");              // let Mumble's GTK theme bits pick a working backend
+                launcher.setProcessEnvironment(env);
+            }
+            qint64 pid = 0;
+            if (!launcher.startDetached(&pid)) {
+                QMessageBox::warning(this, "Connect", "Could not start mumble."); return;
+            }
+            if (minimized) minimizeMumbleWhenShown(pid);
+            mumbleLbl->setText("Starting Mumble…");
+            QElapsedTimer t; t.start();
+            while (!mumbleRunning() && t.elapsed() < 20000) QApplication::processEvents(QEventLoop::AllEvents, 200);
+            if (!mumbleRunning()) { QMessageBox::warning(this, "Connect", "Mumble did not start (no RPC socket)."); return; }
+            // Give the launch URL a moment; if it already connected we're done.
+            QElapsedTimer c; c.start();
+            while (!isConnectedToServer() && c.elapsed() < 4000) waitMs(250);
+        }
+        if (!isConnectedToServer()) {
+            QString pw;
+            if (cfg.pwSource == 0) {
+                bool ok;
+                pw = QString::fromUtf8(sshRun("cat " + cfg.remoteFile("server.pw"), &ok)).trimmed();
+                if (!ok || pw.isEmpty()) { QMessageBox::warning(this, "Connect", QString("Couldn't read the server password from %1.").arg(cfg.rigName())); return; }
+            } else if (cfg.pwSource == 2) pw = cfg.mumblePassword;
+            QUrl full(u); if (!pw.isEmpty()) full.setPassword(pw);
+            bool sent = false;
+            for (int i = 0; i < 10 && !sent; ++i) { sent = mumbleRpc("url", {{"href", full.toString(QUrl::FullyEncoded)}}); if (!sent) waitMs(500); }
+            pw.fill(QChar(0)); full.clear();
+            if (!sent) { mumbleLbl->setText("Mumble refused the connect request"); return; }
+            QElapsedTimer c; c.start();
+            while (!isConnectedToServer() && c.elapsed() < 8000) waitMs(250);
+        }
+        mumbleLbl->setText(isConnectedToServer() ? QString("Connected as %1 @ %2").arg(cfg.mumbleUser, cfg.effMumbleHost())
+                                               : QString("Connect sent — check Mumble window"));
+        ensurePttMode();
+    }
+
+    // Hidden test hook (--ptt-test): key via the same code path as the PTT button, then release.
+    // Hidden test hook (--minimize-test <pid>): run the start-minimized watcher on an existing process.
+    void minimizeTest(qint64 pid) { minimizeMumbleWhenShown(pid); }
+    void raiseTest() { raiseMumble(); }
+    void pttTest(int ms) {
+        QTextStream err(stderr);
+        err << "ptt-test: connected=" << isConnectedToServer() << "\n"; err.flush();
+        startTalk();
+        err << "ptt-test: talking=" << talking << "\n"; err.flush();
+        waitMs(ms);
+        stopTalk();
+        err << "ptt-test: released, talking=" << talking << "\n"; err.flush();
+    }
+private:
+
+    void doDisconnect() {
+        stopTalk(true);
+        raiseMumble();   // bring Mumble forward (also out of the tray); it has no remote disconnect/quit
+        QMessageBox::information(this, "Disconnect",
+            "Stopped talking. To disconnect, use Server > Disconnect in Mumble.\n"
+            "To close it, use Quit from Mumble's own menu (never kill it), so it saves "
+            "your audio settings and skips the setup wizard next time.");
+    }
+
+    void toggleTx() {
+        stopTalk();
+        bool enable = txState != "on";
+        if (enable && QMessageBox::question(this, "TX keying",
+                "Enable TX keying? Anyone talking on the Mumble server will key the FT-710.") != QMessageBox::Yes)
+            return;
+        bool ok;
+        sshRun((enable ? "touch " : "rm -f ") + cfg.remoteFile("tx_enabled"), &ok);
+        if (!ok) QMessageBox::warning(this, "TX keying", "Command failed on the rig host.");
+        poll();
+    }
+
+    void updateTitle() {
+        setWindowTitle(cfg.stationLabel.isEmpty() ? QString("FT-710 Remote") : "FT-710 Remote — " + cfg.stationLabel);
+    }
+    // Apply the current cfg without a restart: title, status box, scope connection, status poll.
+    void applyConfig() {
+        updateTitle();
+        statusBox->setTitle(QString("Status (%1)").arg(cfg.rigName()));
+        startMinChk->setChecked(cfg.startMinimized);
+        if (scopeChk->isChecked()) {
+            scope->stop();
+            if (cfg.configured() || !cfg.scopeHost.isEmpty()) scope->start(cfg.effScopeHost(), quint16(cfg.scopePort));
+        }
+        poll(); pollVolume(); updateUi();
+    }
+    void editSettings() {
+        stopTalk();
+        QDialog d(this); d.setWindowTitle("Settings");
+        auto *tabs = new QTabWidget;
+        auto mk = [](const QString &v, const QString &ph, const QString &tip) {
+            auto *e = new QLineEdit(v); e->setPlaceholderText(ph); e->setToolTip(tip); return e; };
+        auto port = [](int v, const QString &tip) { auto *b = new QSpinBox; b->setRange(1, 65535); b->setValue(v); b->setToolTip(tip); return b; };
+        // Rig host
+        auto *w1 = new QWidget; auto *f1 = new QFormLayout(w1);
+        auto *sshE = mk(cfg.sshHost, "e.g. rigpi, pi@192.168.1.20", "ssh destination of the computer with the FT-710, flrig, radio-bridge "
+                        "and ft710-scope (an ~/.ssh/config alias, host, or user@host). Needs key-based ssh login.");
+        auto *flrigE = mk(cfg.flrigHost, "127.0.0.1", "flrig XML-RPC host as seen FROM the rig host (usually 127.0.0.1).");
+        auto *flrigP = port(cfg.flrigPort, "flrig XML-RPC port (flrig default 12345).");
+        auto *svcE = mk(cfg.bridgeService, "radio-bridge", "systemd --user service running radio_bridge.py on the rig host.");
+        auto *murE = mk(cfg.murmurService, "murmur (blank = don't check)", "System service of the Mumble server on the rig host (murmur, mumble-server). Blank if it runs elsewhere.");
+        auto *dirE = mk(cfg.bridgeCfgDir, "~/.config/radio-bridge", "Bridge config dir on the rig host (tx_enabled, tx_gain, server.pw).");
+        auto *buE = mk(cfg.bridgeUser, "FT710", "Mumble user name the bridge uses (RB_MUMBLE_USER); shown in the status.");
+        f1->addRow("Rig host (ssh):", sshE); f1->addRow("flrig host:", flrigE); f1->addRow("flrig port:", flrigP);
+        f1->addRow("Bridge service:", svcE); f1->addRow("Bridge config dir:", dirE); f1->addRow("Bridge's Mumble name:", buE);
+        f1->addRow("Mumble server service:", murE);
+        auto *testBtn = new QPushButton("Test ssh"); auto *testLbl = new QLabel; testLbl->setWordWrap(true);
+        f1->addRow(testBtn, testLbl);
+        connect(testBtn, &QPushButton::clicked, &d, [sshE, testLbl] {
+            Config t = cfg; t.sshHost = sshE->text().trimmed();
+            static const QRegularExpression dest("^([A-Za-z0-9._-]+@)?[A-Za-z0-9_][A-Za-z0-9._-]*$");
+            if (!dest.match(t.sshHost).hasMatch()) { testLbl->setText("Invalid ssh destination."); return; }
+            testLbl->setText("Testing…"); QApplication::processEvents();
+            const Config saved = cfg; cfg.sshHost = t.sshHost;
+            bool ok; QByteArray out = sshRun("echo ok", &ok, 8000); cfg = saved;
+            testLbl->setText(ok && out.trimmed() == "ok" ? "ssh OK" : "ssh failed (needs key-based login without a prompt)");
+        });
+        tabs->addTab(w1, "Rig host");
+        // Mumble
+        auto *w2 = new QWidget; auto *f2 = new QFormLayout(w2);
+        auto *mhE = mk(cfg.mumbleHost, "blank = rig host", "Mumble server address you connect to from this computer.");
+        auto *mpP = port(cfg.mumblePort, "Mumble server port (default 64738).");
+        auto *muE = mk(cfg.mumbleUser, "your name or callsign", "User name you join the Mumble server with.");
+        auto *mcE = mk(cfg.mumbleChannel, "blank = root channel", "Channel to join, e.g. Radio or Parent/Child.");
+        auto *pwSrc = new QComboBox;
+        pwSrc->addItems({"Read server.pw from the rig host (ssh)", "None / Mumble's saved login", "Store here (plain text in local config)"});
+        pwSrc->setCurrentIndex(qBound(0, cfg.pwSource, 2));
+        auto *pwE = new QLineEdit(cfg.mumblePassword); pwE->setEchoMode(QLineEdit::Password);
+        pwE->setToolTip("Stored only in this computer's config file (" + QSettings().fileName() + "), never anywhere else.");
+        auto syncPw = [pwSrc, pwE] { pwE->setEnabled(pwSrc->currentIndex() == 2); };
+        connect(pwSrc, &QComboBox::currentIndexChanged, &d, syncPw); syncPw();
+        auto *minC = new QCheckBox("Start Mumble minimized"); minC->setChecked(cfg.startMinimized);
+        f2->addRow("Server:", mhE); f2->addRow("Port:", mpP); f2->addRow("User name:", muE); f2->addRow("Channel:", mcE);
+        f2->addRow("Password:", pwSrc); f2->addRow("", pwE); f2->addRow("", minC);
+        tabs->addTab(w2, "Mumble");
+        // Scope
+        auto *w3 = new QWidget; auto *f3 = new QFormLayout(w3);
+        auto *shE = mk(cfg.scopeHost, "blank = rig host", "Host running ft710-scope (as reachable from this computer).");
+        auto *spP = port(cfg.scopePort, "ft710-scope TCP port (default 7355).");
+        f3->addRow("Scope streamer host:", shE); f3->addRow("Scope streamer port:", spP);
+        tabs->addTab(w3, "Band scope");
+        // General
+        auto *w4 = new QWidget; auto *f4 = new QFormLayout(w4);
+        auto *lblE = mk(cfg.stationLabel, "e.g. your callsign", "Shown in the window title.");
+        auto *hfE = mk(cfg.helpFile, "optional, e.g. ~/notes.md", "Your own Markdown notes, shown at the top of Help / About.");
+        f4->addRow("Station label:", lblE); f4->addRow("Help notes file:", hfE);
+        f4->addRow(new QLabel("Settings file: " + QSettings().fileName()));
+        tabs->addTab(w4, "General");
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        auto *lay = new QVBoxLayout(&d); lay->addWidget(tabs); lay->addWidget(bb);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        Config n;
+        connect(bb, &QDialogButtonBox::accepted, &d, [&] {
+            n = cfg;
+            n.sshHost = sshE->text().trimmed(); n.flrigHost = flrigE->text().trimmed(); n.flrigPort = flrigP->value();
+            n.bridgeService = svcE->text().trimmed(); n.murmurService = murE->text().trimmed();
+            n.bridgeCfgDir = dirE->text().trimmed(); n.bridgeUser = buE->text().trimmed();
+            n.mumbleHost = mhE->text().trimmed(); n.mumblePort = mpP->value(); n.mumbleUser = muE->text().trimmed();
+            n.mumbleChannel = mcE->text().trimmed(); while (n.mumbleChannel.startsWith('/')) n.mumbleChannel.remove(0, 1);
+            n.pwSource = pwSrc->currentIndex(); n.mumblePassword = n.pwSource == 2 ? pwE->text() : QString();
+            n.startMinimized = minC->isChecked();
+            n.scopeHost = shE->text().trimmed(); n.scopePort = spP->value();
+            n.stationLabel = lblE->text().trimmed(); n.helpFile = hfE->text().trimmed();
+            const QString err = n.validate();
+            if (!err.isEmpty()) { QMessageBox::warning(&d, "Settings", err); return; }
+            d.accept();
+        });
+        d.resize(560, d.sizeHint().height());
+        if (d.exec() != QDialog::Accepted) return;
+        cfg = n; cfg.save(); applyConfig();
+    }
+
+    void showHelp() {
+        QString md;
+        if (!cfg.helpFile.isEmpty()) {
+            QString path = cfg.helpFile; if (path.startsWith("~/")) path = QDir::home().filePath(path.mid(2));
+            QFile f(path);
+            md = f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) + "\n\n---\n" : path + " not found.\n\n---\n";
+        }
+        md += "**FT-710 Remote 1.0**: Connect launches Mumble and joins the configured server "
+              "(the password, if any, is handed to Mumble via its local RPC socket). Hold PTT or Space to talk; "
+              "releasing, switching windows or closing the app always stops talking. "
+              "**Band scope**: spectrum + waterfall from the FT-710 itself (MENU SCU-LAN10 = ON; streamed by "
+              "the ft710-scope service on the rig host). The shaded band is the approximate passband, the red line "
+              "the VFO. With \"Click to tune\" on, a single click sets VFO-A there via flrig (only while receiving). "
+              "**Span** and **Level** set the radio's own scope span (1 kHz-1 MHz) and scope level (-30 to +30 dB, 0.5 dB "
+              "steps) through flrig (CAT SS05/SS04, display settings only). With \"Auto contrast\" off the colours are fixed, "
+              "so Level works like the radio's knob; turn it on to let the app rescale colours itself. "
+              "**Settings…** holds the rig host, flrig, Mumble server and scope addresses.";
+        QDialog d(this); d.setWindowTitle("Help / About"); d.resize(640, 520);
+        auto *l = new QVBoxLayout(&d); auto *tb = new QTextBrowser; tb->setMarkdown(md); l->addWidget(tb);
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Close); l->addWidget(bb);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        d.exec();
+    }
+
+    void poll() {
+        if (pollProc) return;   // previous poll still running
+        if (!cfg.configured()) { setOffline(); return; }
+        pollProc = new QProcess(this);
+        QStringList args = sshArgs(log->isVisible() ? "bash -s log" : "bash -s");
+        connect(pollProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
+            QString out = QString::fromUtf8(pollProc->readAllStandardOutput());
+            pollProc->deleteLater(); pollProc = nullptr;
+            if (st != QProcess::NormalExit || code == 255) { setOffline(); return; }
+            parse(out);
+        });
+        connect(pollProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+            if (pollProc && pollProc->state() == QProcess::NotRunning) { pollProc->deleteLater(); pollProc = nullptr; setOffline(); }
+        });
+        pollProc->start("ssh", args);
+        pollProc->write(pollScript());
+        pollProc->closeWriteChannel();
+        QTimer::singleShot(8000, pollProc, [p = pollProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+        updateUi();
+    }
+
+    static void colored(QLabel *l, const QString &t, const char *color) {
+        l->setText(t); l->setStyleSheet(QString("color:%1;").arg(color));
+    }
+    void setOffline() {
+        for (auto *l : {murmurLbl, bridgeLbl, connLbl, rxLbl, txEnLbl, pttLbl, vfoLbl}) colored(l, cfg.configured() ? cfg.rigName() + " unreachable" : "not configured (Settings…)", "gray");
+        txState = "unknown"; radioRx = false; setTxEnabled(false); updateUi();
+    }
+    void parse(const QString &out) {
+        QString logText;
+        QMap<QString, QString> kv;
+        int li = out.indexOf("---LOG---\n");
+        QString head = li >= 0 ? out.left(li) : out;
+        if (li >= 0) logText = out.mid(li + 10);
+        for (const QString &line : head.split('\n')) {
+            int eq = line.indexOf('=');
+            if (eq > 0) kv[line.left(eq)] = line.mid(eq + 1);
+        }
+        auto act = [](QLabel *l, const QString &s) { colored(l, s.isEmpty() ? "?" : s, s == "active" ? "green" : s == "not checked" ? "gray" : "#c00"); };
+        act(murmurLbl, kv["murmur"]);
+        act(bridgeLbl, kv["bridge"]);
+
+        const QString c = kv["conn"];
+        bool connected = c.contains("Mumble connected") || c.contains("status connected=True");
+        if (kv["bridge"] != "active") colored(connLbl, "—", "gray");
+        else if (c.isEmpty()) colored(connLbl, "starting…", "gray");
+        else colored(connLbl, connected ? "connected as " + cfg.bridgeUser : "NOT connected", connected ? "green" : "#c00");
+
+        QRegularExpression rx("rx_frames_sent=(\\d+)");
+        auto m = rx.match(kv["status"]);
+        rxLbl->setText(m.hasMatch() ? m.captured(1) + " (as of last 60 s status line)" : "no status line yet");
+
+        txState = kv["tx"];
+        if (txState == "on") colored(txEnLbl, "ENABLED — Mumble audio keys the radio", "#c00");
+        else colored(txEnLbl, "disabled (receive-only)", "green");
+
+        const QString p = kv["ptt"].trimmed();
+        radioRx = (p == "0");
+        if (p.isEmpty()) colored(pttLbl, "flrig not answering", "gray");
+        else if (p == "1") { pttLbl->setText("  TX  "); pttLbl->setStyleSheet("color:white; background:#c00;"); }
+        else colored(pttLbl, "RX", "green");
+
+        bool okv; double hz = kv["vfo"].trimmed().toDouble(&okv);
+        parseTx(kv["txgain"]);
+        vfoLbl->setText(okv && hz > 0 ? QString::number(hz / 1e6, 'f', 6) + " MHz" : "?");
+
+        if (log->isVisible() && li >= 0) log->setPlainText(logText.trimmed());
+        updateUi();
+    }
+    void updateUi() {
+        bool running = mumbleRunning();
+        if ((!mumbleLbl->text().startsWith("Connect request") && !mumbleLbl->text().startsWith("WARNING")) || !running)
+            mumbleLbl->setText(running ? "Mumble running" : "Mumble not running");
+        disconnectBtn->setEnabled(running);
+        ptt->setEnabled(running || talking);
+        txBtn->setEnabled(txState == "on" || txState == "off");
+        txBtn->setText(txState == "on" ? "Disable TX keying (go receive-only)"
+                     : txState == "off" ? "Enable TX keying" : "TX keying: unknown");
+    }
+};
+
+// First run of this build: copy settings from an older install that stored them under another
+// organization directory (~/.config/<org>/ft710-remote.conf). Keys already set here win.
+static void migrateLegacySettings() {
+    QSettings now;
+    if (now.value("settings/migrated", false).toBool()) return;
+    const QString mine = QFileInfo(now.fileName()).absoluteFilePath();
+    const QString root = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+    QFileInfo best;
+    for (const QFileInfo &dir : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QFileInfo f(QDir(dir.absoluteFilePath()).filePath("ft710-remote.conf"));
+        if (f.isFile() && f.absoluteFilePath() != mine && (!best.exists() || f.lastModified() > best.lastModified())) best = f;
+    }
+    if (best.exists()) {
+        QSettings old(best.absoluteFilePath(), QSettings::IniFormat);
+        int n = 0;
+        for (const QString &k : old.allKeys()) if (!now.contains(k)) { now.setValue(k, old.value(k)); ++n; }
+        now.setValue("settings/migratedFrom", best.absoluteFilePath());
+        QTextStream(stderr) << "settings: migrated " << n << " keys from " << best.absoluteFilePath() << Qt::endl;
+    }
+    now.setValue("settings/migrated", true);
+    now.sync();
+}
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    app.setApplicationName("ft710-remote");
+    app.setOrganizationName("FT-710_remote");
+    app.setDesktopFileName("ft710-remote");
+    migrateLegacySettings();
+    cfg.load();
+    if (app.arguments().contains("--print-config")) {   // non-interactive check: effective settings (no password)
+        QTextStream o(stdout);
+        o << "file=" << QSettings().fileName() << "\nssh=" << cfg.sshHost << "\nflrig=" << cfg.flrigUrl()
+          << "\nbridge=" << cfg.bridgeService << " dir=" << cfg.bridgeCfgDir << " murmur=" << cfg.murmurService
+          << "\nmumble=" << cfg.mumbleUser << "@" << cfg.effMumbleHost() << ":" << cfg.mumblePort << "/" << cfg.mumbleChannel
+          << " pwSource=" << cfg.pwSource << "\nscope=" << cfg.effScopeHost() << ":" << cfg.scopePort
+          << "\nlabel=" << cfg.stationLabel << " help=" << cfg.helpFile << " startMin=" << cfg.startMinimized
+          << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate()) << Qt::endl;
+        return 0;
+    }
+    Main w;
+    if (!w.restoreSavedGeometry())
+        w.resize(QSettings().value("showScope", true).toBool() ? QSize(760, 880) : QSize(520, 560));
+    w.show();
+    QTimer::singleShot(500, &w, [&w] { w.enableGeometrySaving(); });
+    const QStringList args = app.arguments();
+    if (args.contains("--connect") || args.contains("--ptt-test"))   // hidden test hooks
+        QTimer::singleShot(500, &w, [&w, args] {
+            w.doConnect();
+            QTextStream(stderr) << "connect: connected=" << w.isConnectedToServer() << Qt::endl;
+            if (args.contains("--ptt-test")) w.pttTest(3000);
+        });
+    if (int i = args.indexOf("--set-volume"); i >= 0 && i + 1 < args.size())   // hidden test hook
+        QTimer::singleShot(3000, &w, [&w, pct = args[i + 1].toInt()] {
+            w.setVolumeForTest(pct); QTextStream(stderr) << "set-volume: " << pct << Qt::endl; });
+    if (int i = args.indexOf("--tx-test"); i >= 0) {   // hidden test hook: read back, optionally set
+        QTimer::singleShot(4000, &w, [&w] {
+            QTextStream(stderr) << "tx-read: enabled=" << w.txEnabledForTest() << " value=" << w.txForTest() << Qt::endl; });
+        if (i + 1 < args.size() && !args[i + 1].startsWith("-"))
+            QTimer::singleShot(4500, &w, [&w, pct = args[i + 1].toInt()] {
+                w.setTxForTest(pct); QTextStream(stderr) << "tx-set: " << pct << Qt::endl; });
+    }
+    if (int i = args.indexOf("--minimize-test"); i >= 0 && i + 1 < args.size())   // hidden test hook
+        QTimer::singleShot(200, &w, [&w, pid = args[i + 1].toLongLong()] { w.minimizeTest(pid); });
+    if (args.contains("--raise-test"))   // hidden test hook
+        QTimer::singleShot(200, &w, [&w] { w.raiseTest(); });
+    if (qEnvironmentVariableIsSet("FT710_SMOKE_MS"))   // headless smoke test: auto-quit
+        QTimer::singleShot(qEnvironmentVariable("FT710_SMOKE_MS").toInt(), &app, [&] {
+            QTextStream out(stdout);
+            for (auto *l : w.findChildren<QLabel *>()) out << "label: " << l->text() << "\n";
+            for (auto *b : w.findChildren<QPushButton *>()) out << "button: " << b->text().replace('\n', ' ') << (b->isEnabled() ? "" : " [disabled]") << "\n";
+            app.quit();
+        });
+    return app.exec();
+}

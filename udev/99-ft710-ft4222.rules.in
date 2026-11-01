@@ -1,0 +1,6 @@
+# FT-710 internal FT4222 (band-scope stream; present when MENU SCU-LAN10 = ON).
+# Gives the user that runs ft710-scope.service read/write access to it (the streamer only reads frames).
+# Install (replace @USER@ with that user):
+#   sed "s/@USER@/$USER/" 99-ft710-ft4222.rules.in | sudo tee /etc/udev/rules.d/99-ft710-ft4222.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=0403
+SUBSYSTEM=="usb", ATTR{idVendor}=="0403", ATTR{idProduct}=="601c", OWNER="@USER@", MODE="0660"

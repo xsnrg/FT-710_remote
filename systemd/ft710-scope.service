@@ -1,0 +1,18 @@
+# systemd --user unit for the FT-710 band-scope streamer (read-only).
+# Install: cp ft710-scope.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#          systemctl --user enable --now ft710-scope
+# Settings: ~/.config/ft710-scope/scope.env (copy server/ft710-scope/scope.env.example).
+# Without FT710_SCOPE_ALLOW only localhost clients are accepted.
+[Unit]
+Description=FT-710 band-scope streamer (FT4222 SPI -> TCP, read-only)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/ft710-scope/scope.env
+ExecStart=/usr/bin/python3 -u %h/ft710-scope/ft710_scope.py serve
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target

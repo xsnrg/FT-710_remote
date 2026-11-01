@@ -1,0 +1,30 @@
+# build output
+build/
+app/build/
+*.o
+# editor / backup files
+*.bak*
+*~
+*.swp
+.vscode/
+.idea/
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+# FTDI library (proprietary download, not redistributed here)
+lib/
+include/
+vendor/
+*.zip
+*.tgz
+# local, station-specific settings and secrets
+*.env
+!*.env.example
+server.pw
+*.pw
+mumble.sqlite
+*.p12
+*.pem
+*.key
