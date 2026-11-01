@@ -73,6 +73,47 @@ struct Conn {
         }
         return res;
     }
+    // All top-level windows (managed or not, e.g. hidden in the tray) of a process (pid > 0) or
+    // of Mumble (WM_CLASS), that accept WM_DELETE_WINDOW and carry a WM_STATE (real client windows,
+    // not Qt's helper/group-leader windows).
+    QList<xcb_window_t> closableWindows(qint64 pid) {
+        QList<xcb_window_t> res, fallback;
+        if (!c) return res;
+        auto *t = xcb_query_tree_reply(c, xcb_query_tree(c, root), nullptr);
+        if (!t) return res;
+        const xcb_atom_t aPid = atom("_NET_WM_PID"), aProt = atom("WM_PROTOCOLS"), aDel = atom("WM_DELETE_WINDOW"),
+                         aState = atom("WM_STATE");
+        xcb_window_t *kids = xcb_query_tree_children(t);
+        for (int i = 0; i < xcb_query_tree_children_length(t); ++i) {
+            const xcb_window_t w = kids[i];
+            if (pid > 0) {
+                QByteArray p = prop(w, aPid, XCB_ATOM_CARDINAL);
+                uint32_t v = 0; if (p.size() >= 4) memcpy(&v, p.constData(), 4);
+                if (qint64(v) != pid) continue;
+            } else if (!prop(w, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING).toLower().contains("mumble")) continue;
+            if (!prop(w, XCB_ATOM_WM_TRANSIENT_FOR, XCB_ATOM_WINDOW).isEmpty()) continue;
+            QByteArray pr = prop(w, aProt, XCB_ATOM_ATOM); bool del = false;
+            for (int k = 0; k + 4 <= pr.size(); k += 4) { xcb_atom_t a; memcpy(&a, pr.constData() + k, 4); if (a == aDel) del = true; }
+            if (!del) continue;
+            if (!prop(w, aState, aState).isEmpty()) res.append(w);     // has been managed by the WM
+            else {                                                    // never managed: skip tiny helper windows
+                auto *g = xcb_get_geometry_reply(c, xcb_get_geometry(c, w), nullptr);
+                if (g && g->width > 50 && g->height > 50) fallback.append(w);
+                free(g);
+            }
+        }
+        free(t);
+        return res.isEmpty() ? fallback : res;
+    }
+    // ICCCM WM_DELETE_WINDOW sent straight to the window: exactly what the title-bar close button
+    // does, so the program runs its normal close path (Mumble saves its settings, may ask first).
+    void requestClose(xcb_window_t w) {
+        xcb_client_message_event_t ev{};
+        ev.response_type = XCB_CLIENT_MESSAGE; ev.format = 32; ev.window = w; ev.type = atom("WM_PROTOCOLS");
+        ev.data.data32[0] = atom("WM_DELETE_WINDOW"); ev.data.data32[1] = XCB_CURRENT_TIME;
+        xcb_send_event(c, 0, w, XCB_EVENT_MASK_NO_EVENT, (const char *)&ev);
+        xcb_flush(c);
+    }
     void iconify(xcb_window_t w) { clientMessage(w, atom("WM_CHANGE_STATE"), 3 /*IconicState*/); }
     void activate(xcb_window_t w) { clientMessage(w, atom("_NET_ACTIVE_WINDOW"), 2 /*pager*/, XCB_CURRENT_TIME); }
 };
@@ -458,9 +499,8 @@ public:
         auto *row = new QHBoxLayout;
         connectBtn = new QPushButton("Connect");
         disconnectBtn = new QPushButton("Disconnect…");
-        disconnectBtn->setToolTip("Stops talking and brings Mumble to the front. Mumble 1.4 has no remote "
-                                  "disconnect/quit, so use Server > Disconnect or Quit in Mumble itself, "
-                                  "so it saves its settings.");
+        disconnectBtn->setToolTip("Stops talking and offers to close Mumble the normal way (like its own close/Quit, "
+                                  "so it saves its settings), even when it is hidden in the tray.");
         mumbleLbl = new QLabel;
         row->addWidget(connectBtn); row->addWidget(disconnectBtn); row->addWidget(mumbleLbl, 1);
         v->addLayout(row);
@@ -860,6 +900,7 @@ private:
     // Bring Mumble to the front: RPC focus (show+raise), plus un-minimize it if it's an XWayland window.
     void raiseMumble() {
         mumbleRpc("focus", {});
+        QDBusInterface("net.sourceforge.mumble.mumble", "/", "net.sourceforge.mumble.Mumble").call(QDBus::NoBlock, "focus");
         QTimer::singleShot(150, this, [] { x11::Conn x; for (xcb_window_t w : x.mumbleWindows(0, false)) x.activate(w); });
     }
     QToolButton *logBtn; QPushButton *settingsBtn; QGroupBox *statusBox;
@@ -1200,13 +1241,41 @@ public:
     }
 private:
 
+    // Disconnect: stop talking, then (if confirmed) close Mumble the normal way. Mumble 1.4 has
+    // no remote disconnect/quit (RPC or D-Bus), and when it was started minimized it sits hidden in
+    // the tray, where "bring to front" can't reach it. So we send WM_DELETE_WINDOW to its main window
+    // (works hidden too, under XWayland): the same as its close button, so it saves its settings.
+    // Never kills it. Falls back to showing Mumble when it isn't an X11 (XWayland) window.
     void doDisconnect() {
         stopTalk(true);
-        raiseMumble();   // bring Mumble forward (also out of the tray); it has no remote disconnect/quit
-        QMessageBox::information(this, "Disconnect",
-            "Stopped talking. To disconnect, use Server > Disconnect in Mumble.\n"
-            "To close it, use Quit from Mumble's own menu (never kill it), so it saves "
-            "your audio settings and skips the setup wizard next time.");
+        if (!mumbleRunning()) { mumbleLbl->setText("Mumble is not running"); return; }
+        QMessageBox mb(QMessageBox::Question, "Disconnect",
+            "Stopped talking. Close Mumble now?\n\nThis disconnects from the server and quits Mumble "
+            "normally (as its own Quit does), so it keeps its settings. Mumble may ask to confirm.",
+            QMessageBox::NoButton, this);
+        QPushButton *closeB = mb.addButton("Close Mumble", QMessageBox::AcceptRole);
+        QPushButton *showB = mb.addButton("Show Mumble", QMessageBox::ActionRole);
+        mb.addButton(QMessageBox::Cancel);
+        mb.setDefaultButton(closeB);
+        mb.exec();
+        if (mb.clickedButton() == showB) { raiseMumble(); return; }
+        if (mb.clickedButton() != closeB) return;
+        QList<xcb_window_t> wins;
+        { x11::Conn x; wins = x.closableWindows(0); for (xcb_window_t w : wins) x.requestClose(w); }
+        if (wins.isEmpty()) {
+            raiseMumble();
+            QMessageBox::information(this, "Disconnect",
+                "Couldn't reach Mumble's window (it is not running under XWayland). "
+                "Use Server > Disconnect or Quit in Mumble itself.");
+            return;
+        }
+        mumbleLbl->setText("Closing Mumble…");
+        QElapsedTimer t; t.start();
+        while (mumbleRunning() && t.elapsed() < 4000) waitMs(250);
+        if (!mumbleRunning()) { mumbleLbl->setText("Mumble closed"); updateUi(); return; }
+        // Still running: it is probably asking "close or minimize?", or is set to minimize on close.
+        raiseMumble();
+        mumbleLbl->setText("Mumble is still running — answer its prompt or use Quit in Mumble");
     }
 
     void toggleTx() {
@@ -1456,6 +1525,12 @@ int main(int argc, char **argv) {
     app.setDesktopFileName("ft710-remote");
     migrateLegacySettings();
     cfg.load();
+    if (int i = app.arguments().indexOf("--close-windows-test"); i >= 0 && i + 1 < app.arguments().size()) {   // hidden test hook
+        x11::Conn x; const auto ws = x.closableWindows(app.arguments().at(i + 1).toLongLong());
+        for (xcb_window_t w : ws) x.requestClose(w);
+        QTextStream(stdout) << "close requested for " << ws.size() << " window(s)\n";
+        return ws.isEmpty() ? 1 : 0;
+    }
     if (app.arguments().contains("--print-config")) {   // non-interactive check: effective settings (no password)
         QTextStream o(stdout);
         o << "file=" << QSettings().fileName() << "\nssh=" << cfg.sshHost << "\nflrig=" << cfg.flrigUrl()

@@ -27,7 +27,8 @@ It has two halves:
   frequency only).
 * Status of murmur, the bridge, flrig and `tx_enabled` polled over ssh.
 * Window size, volumes and scope settings remembered between runs.
-* Optional: start Mumble minimized.
+* Optional: start Mumble minimized (hidden in its tray icon). **Disconnect…** offers to close
+  Mumble the normal way (WM_DELETE_WINDOW, like its own close button), even while hidden.
 
 ## Architecture
 
