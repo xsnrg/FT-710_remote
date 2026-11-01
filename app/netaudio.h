@@ -413,6 +413,9 @@ private:
         run("systemctl", {"--user", "is-active", RECV_UNIT}, {}, 3000, [this](bool, QByteArray out) {
             localBusy = false; localUnit = QString::fromUtf8(out).trimmed();
             if (localUnit.isEmpty()) localUnit = "unknown";
+            // Keep the listen monitor in step with the receiver (needed when adopting a running stream:
+            // at adopt time the unit state is still unknown, so the first syncListen() did nothing).
+            if (wanted && !busy) syncListen();
         });
     }
 

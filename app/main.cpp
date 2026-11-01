@@ -526,7 +526,8 @@ public:
 
         // RX volume: Mumble's playback stream on this computer (PipeWire/Pulse sink-input), same as the
         // per-app slider in GNOME sound settings. Never touches the radio or the master volume.
-        auto *volRow = new QHBoxLayout;
+        // Hidden in direct-TX mode (Mumble is not used there; the "RX network" row has the volume).
+        volRowW = new QWidget; auto *volRow = new QHBoxLayout(volRowW); volRow->setContentsMargins(0, 0, 0, 0);
         volRow->addWidget(new QLabel("RX volume (Mumble):"));
         volSlider = new QSlider(Qt::Horizontal);
         volSlider->setRange(0, 150); volSlider->setPageStep(5); volSlider->setSingleStep(1);
@@ -534,7 +535,7 @@ public:
         volLbl = new QLabel("—"); volLbl->setMinimumWidth(volLbl->fontMetrics().horizontalAdvance("150%  "));
         muteBtn = new QToolButton; muteBtn->setText("Mute"); muteBtn->setCheckable(true);
         volRow->addWidget(volSlider, 1); volRow->addWidget(volLbl); volRow->addWidget(muteBtn);
-        v->addLayout(volRow);
+        v->addWidget(volRowW);
         setVolEnabled(false);
 
         // TX level: gain the bridge on the rig host applies to Mumble audio before it plays it into the FT-710
@@ -1086,12 +1087,14 @@ private:
     }
     void updateNetUi() {
         const bool on = naCfg.enabled();
+        volRowW->setVisible(!naCfg.txNet());   // Mumble's playback slider means nothing without Mumble
         netRow->setVisible(on);
         if (statusForm) statusForm->setRowVisible(netLbl, on);
         if (!on) return;
         const bool act = na->active();
         netStartBtn->setText(act ? "Stop" : "Start");
-        const QString st = na->statusText();
+        QString st = na->statusText();
+        if (act && naCfg.listenMute) st += " · Listen is off (not playing on this computer's speakers)";
         colored(netLbl, st, !act ? "gray" : na->linkUp() ? "green" : "#c60");
         const double db = na->levelDb();
         if (act && db > -119) {
@@ -1103,7 +1106,7 @@ private:
 public:
     NetAudio *netAudio() { return na; }
 private:
-    QSlider *volSlider; QLabel *volLbl; QToolButton *muteBtn;
+    QWidget *volRowW; QSlider *volSlider; QLabel *volLbl; QToolButton *muteBtn;
     QTimer volTimer, volApply;
     QProcess *volProc = nullptr;
     QList<int> volStreams;       // current Mumble sink-input indexes
@@ -1683,8 +1686,10 @@ private:
             tx->stop(true, true, false);
             note("Direct TX off: TX gate stopping, radio-bridge being restored");
         }
+        const bool wasTxNet = naCfg.txNet();
         cfg = n; cfg.save();
         naCfg = nn; naCfg.save();
+        txModeSwitched(wasTxNet);
         if (txWasActive && naCfg.txNet()) {
             const QString txAfter = cfg.sshHost + "|" + cfg.bridgeService + "|" + cfg.flrigUrl() + "|" + naCfg.micSource + "|" + naCfg.txUnit + "|"
                                     + QString::number(naCfg.txPort) + "|" + naCfg.describe();
@@ -1696,6 +1701,18 @@ private:
         applyConfig();
     }
 
+    // Without Mumble nothing else plays the radio here: switching to direct TX turns Listen on;
+    // switching back to Mumble TX turns it off again (Mumble plays the radio; avoid hearing it twice).
+    void txModeSwitched(bool wasTxNet) {
+        if (wasTxNet != naCfg.txNet() && naCfg.enabled() && netMuteBtn->isChecked() == naCfg.txNet())
+            netMuteBtn->setChecked(!naCfg.txNet());
+    }
+public:
+    // Test hook (FT710_SMOKE_TXGATE=0/1): the same TX-mode switch the Settings dialog does, then refresh.
+    void testSwitchTx(bool direct) {
+        const bool was = naCfg.txNet(); naCfg.txGate = direct; naCfg.save(); txModeSwitched(was); applyConfig();
+    }
+private:
     void showHelp() {
         QString md;
         if (!cfg.helpFile.isEmpty()) {
@@ -1992,11 +2009,16 @@ int main(int argc, char **argv) {
     }
     if (args.contains("--raise-test"))   // hidden test hook
         QTimer::singleShot(200, &w, [&w] { w.raiseTest(); });
+    if (qEnvironmentVariableIsSet("FT710_SMOKE_TXGATE"))   // test hook: switch the TX mode like Settings does
+        QTimer::singleShot(1000, &w, [&w] { w.testSwitchTx(qEnvironmentVariable("FT710_SMOKE_TXGATE") == "1"); });
     if (qEnvironmentVariableIsSet("FT710_SMOKE_MS"))   // headless smoke test: auto-quit
         QTimer::singleShot(qEnvironmentVariable("FT710_SMOKE_MS").toInt(), &app, [&] {
             QTextStream out(stdout);
             for (auto *l : w.findChildren<QLabel *>()) out << "label: " << l->text() << "\n";
             for (auto *b : w.findChildren<QPushButton *>()) out << "button: " << b->text().replace('\n', ' ') << (b->isEnabled() ? "" : " [disabled]") << "\n";
+            for (auto *b : w.findChildren<QToolButton *>()) out << "toolbutton: " << b->text() << (b->isEnabled() ? "" : " [disabled]") << (b->isVisible() ? "" : " [hidden]") << "\n";
+            for (auto *sl : w.findChildren<QSlider *>()) out << "slider: " << sl->toolTip().left(40) << " value=" << sl->value()
+                                                            << (sl->isEnabled() ? "" : " [disabled]") << (sl->isVisible() ? "" : " [hidden]") << "\n";
             app.quit();
         });
     return app.exec();

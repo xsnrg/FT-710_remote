@@ -192,6 +192,9 @@ How it works:
   The status line shows state, uptime and restart count.
 * **Listen** plays the stream on this computer's speakers via a `pw-loopback` with its own
   volume (0–150 %); off by default. It never changes what WSJT-X/fldigi record.
+  With **direct TX** (no Mumble) the Mumble volume row is hidden and this RX network slider is
+  the speaker volume; switching to direct TX turns Listen on (switching back turns it off).
+  The status line says when Listen is off.
 
 **WSJT-X / fldigi**: choose **FT-710 RX (network)** as the audio input (WSJT-X: Settings →
 Audio → Input; fldigi: Configure → Sound Card → PulseAudio/PortAudio capture). It is a
@@ -313,6 +316,7 @@ cd server/ft710-txgate
 python3 test_txgate.py [--null-sink]            # the gate: auth, allowlist, timeouts, gaps, failsafes
 python3 test_app_txgate.py ../../build/ft710-remote   # the real app (CLI + GUI PTT path) against the gate
 python3 test_app_scripts.py                     # the app's ssh start/stop scripts with temporary user units
+python3 ../../app/tests/test_ui_modes.py         # UI rows/sliders per audio + TX mode (offscreen, temp config)
 ```
 
 ## Safety
