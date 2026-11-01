@@ -4,7 +4,7 @@ against a local ft710_txgate.py with a fake flrig and a fake pacat (see test_txg
 Never touches a real radio or sound device.
 Run: python3 test_app_txgate.py /path/to/ft710-remote
 """
-import os, signal, subprocess, sys, time
+import array, math, os, shutil, signal, subprocess, sys, time, wave
 import test_txgate as T
 
 APP = sys.argv[1] if len(sys.argv) > 1 else os.path.join(T.HERE, "..", "..", "build", "ft710-remote")
@@ -46,6 +46,42 @@ def main():
         check("app %s: tone reached the sink at the expected level" % name, lo <= peak(g) <= hi, "peak %d" % peak(g))
         check("app %s: gate reported KEYED to the app" % name, "KEYED" in out, out[-400:] if "KEYED" not in out else "")
         g.stop()
+
+    # real capture path (pw-record): a temporary low-priority virtual source with a 1 kHz tone, or a
+    # real source named by FT710_TEST_MIC (its audio only reaches the fake pacat). Regression for the
+    # live bug where pw-record never captured (node.dont-fallback + --target) and no packet reached the gate.
+    src = os.environ.get("FT710_TEST_MIC", "")
+    procs = []
+    if not src and shutil.which("pw-loopback") and shutil.which("pw-play"):
+        src = "ft710_test_vsrc"
+        procs.append(subprocess.Popen(["pw-loopback", "-n", "ft710-test-vsrc", "-m", "[ MONO ]",
+            "--capture-props={ media.class = Audio/Sink node.name = ft710_test_vsrc_in priority.session = 1 priority.driver = 1 }",
+            "--playback-props={ media.class = Audio/Source node.name = ft710_test_vsrc priority.session = 1 priority.driver = 1 }"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        time.sleep(1.0)
+        wav = os.path.join(T.TMP, "tone.wav")
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(48000)
+            w.writeframes(array.array("h", [int(6000 * math.sin(2 * math.pi * 1000 * i / 48000)) for i in range(48000 * 20)]).tobytes())
+        procs.append(subprocess.Popen(["pw-play", "--target", "ft710_test_vsrc_in", wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    if src:
+        try:
+            g = T.Gate("app_mic", TG_FIRST_AUDIO_S=0.5).start(); time.sleep(0.2)
+            t = time.monotonic(); p = app(g, 1500, "--mic", "--mic-source", src); out = p.communicate(timeout=40)[0]
+            cs = T.calls_since(t); data = T.pacat_audio(g)[1]
+            check("app mic capture: one key + one unkey, no audio-gap unkey", [v for _, v in cs] == [1, 0] and p.returncode == 0
+                  and "no mic audio" not in out and "gap" not in out, "%s rc=%s %s" % (cs, p.returncode, out[-600:]))
+            check("app mic capture: mic packets reached the gate's sink", len(data) > 0 and peak(g) > 0, "chunks %d peak %d" % (len(data), peak(g)))
+            g.stop()
+            g = T.Gate("app_nomic").start(); time.sleep(0.2)
+            t = time.monotonic(); p = app(g, 1000, "--mic", "--mic-source", "ft710_no_such_source"); out = p.communicate(timeout=40)[0]
+            check("app missing mic source: never keys, says why", T.calls_since(t) == [] and p.returncode != 0 and "source not found" in out,
+                  "%s rc=%s %s" % (T.calls_since(t), p.returncode, out[-400:]))
+            g.stop()
+        finally:
+            for q in procs: q.terminate(); q.wait(5)
+    else:
+        print("SKIP app mic capture (no pw-loopback/pw-play)")
 
     # app frozen (SIGSTOP) while holding PTT -> gate unkeys by itself (audio gap / heartbeat)
     g = T.Gate("app_stop").start(); time.sleep(0.2)

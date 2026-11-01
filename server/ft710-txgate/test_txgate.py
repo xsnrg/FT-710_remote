@@ -239,12 +239,32 @@ def main():
     check("control connection loss: immediate unkey", [v for _, v in cs] == [1, 0] and cs[-1][0] - (tc - t) < 0.1, str(cs))
     g.stop()
 
-    # 6 audio gap
-    g = Gate("gap").start(); c = Client(g)
+    # 6a defaults: first mic audio may take up to TG_FIRST_AUDIO_S (2 s); short mid-over gaps play silence
+    g = Gate("firstaudio").start(); c = Client(g)
+    t = keyed_over(g, c, 1.5, audio=False)
+    check("first audio: still keyed 1.5 s after key with no packets yet", [v for _, v in calls_since(t)] == [1])
+    c.audio_on = True; time.sleep(0.8); c.audio_on = False; tg = time.monotonic(); time.sleep(1.2)
+    check("mid-over gap of 1.2 s (< TG_GAP_S 2 s): still keyed", [v for _, v in calls_since(t)] == [1])
+    st, data = pacat_audio(g)
+    zero = sum(d[1] for d in data if d[0] > tg + 0.4 and d[2] == 0); loud = [d for d in data if d[0] > tg + 0.4 and d[2] > 0]
+    check("mid-over gap: silence played, no stale audio", zero > 0.4 * 48000 and not loud, "%d zero samples, %d loud chunks" % (zero, len(loud)))
+    time.sleep(1.1)
+    cs = calls_since(t); d = cs[-1][0] - (tg - t) if len(cs) == 2 else -1
+    check("mid-over gap > 2 s: unkey", [v for _, v in cs] == [1, 0] and 1.95 <= d <= 2.3, "%s gap->unkey %.3f s" % (cs, d))
+    check("mid-over gap: event", any("mic audio gap over 2.0 s" in e for e in c.events()), str(c.events()))
+    c.send("PTT 0"); time.sleep(0.2)
+    t = keyed_over(g, c, 2.4, audio=False)
+    cs = calls_since(t)
+    check("no mic audio at all: unkey ~2 s after key", [v for _, v in cs] == [1, 0] and 1.95 <= cs[-1][0] - cs[0][0] <= 2.3, str(cs))
+    check("no mic audio: event", any("no mic audio within 2.0 s" in e for e in c.events()), str(c.events()))
+    c.send("PTT 0"); c.close(); g.stop()
+
+    # 6b short configured gap (TG_GAP_S=0.2): latch and re-key behaviour
+    g = Gate("gap", TG_GAP_S=0.2).start(); c = Client(g)
     t = keyed_over(g, c, 0.5); c.audio_on = False; tg = time.monotonic(); time.sleep(0.6)
     cs = calls_since(t)
     d = cs[-1][0] - (tg - t) if cs else -1
-    check("audio gap > 200 ms: unkey", [v for _, v in cs] == [1, 0] and 0.18 <= d <= 0.3, "%s gap->unkey %.3f s" % (cs, d))
+    check("audio gap > TG_GAP_S 200 ms: unkey", [v for _, v in cs] == [1, 0] and 0.18 <= d <= 0.3, "%s gap->unkey %.3f s" % (cs, d))
     c.audio_on = True; time.sleep(0.4)
     check("audio gap: latched until PTT released", [v for _, v in calls_since(t)] == [1, 0])
     c.send("PTT 0"); time.sleep(0.1); t2 = time.monotonic(); c.send("PTT 1"); time.sleep(0.3)

@@ -8,6 +8,7 @@
 #pragma once
 #include <QMessageAuthenticationCode>
 #include <QUdpSocket>
+#include <QSet>
 #include <QRandomGenerator>
 #include <opus/opus.h>
 
@@ -92,7 +93,12 @@ public:
     bool gateKeyed() const { return gst.value("keyed") == "1"; }
     QString rigPtt() const { return st == Ready ? gst.value("ptt") : QString(); }   // flrig readout via the gate
     double micDb() const { return micLevel; }
-    bool micUp() const { return micAlive.isValid() && micAlive.elapsed() < 1000; }
+    bool micUp() const { return toneMode || (micAlive.isValid() && micAlive.elapsed() < 1000); }
+    // Why the mic is not usable ("" when it is capturing).
+    QString micProblem() const {
+        if (micUp()) return {};
+        return micErr.isEmpty() ? QString("microphone is not capturing") : "microphone: " + micErr;
+    }
     QString codec() const { return opusKbps ? QString("Opus %1 kbit/s").arg(opusKbps) : QString("L16"); }
     QString lastEvent() const { return event; }
     QString statusText() const {
@@ -157,6 +163,7 @@ public:
         if (on == ptt) return true;
         if (on) {
             if (st != Ready) return false;
+            if (!micUp()) { log("PTT refused: " + micProblem()); return false; }   // never key without mic audio
             micBuf.clear(); toneSent = 0;
             if (enc) opus_encoder_ctl(enc, OPUS_RESET_STATE);
             ptt = true; pttSince.start();
@@ -178,7 +185,7 @@ private:
     QMap<QString, QString> gst;
     bool ptt = false; QElapsedTimer pttSince;
     QProcess *mic = nullptr, *prep = nullptr; QByteArray micBuf;
-    double micLevel = -120; QElapsedTimer micAlive;
+    double micLevel = -120; QElapsedTimer micAlive; QString micErr, micErrLogged; QByteArray micErrBuf;
     OpusEncoder *enc = nullptr; int opusKbps = 0; int frame = 480;   // samples per packet
     quint16 seq = 0; quint32 ts = 0, ssrc = 0; qint64 toneSent = 0; QElapsedTimer toneClock;
 
@@ -286,17 +293,43 @@ private:
     void failHard(const QString &why) { if (st == Off || st == Backoff) st = Preparing; fail(why); retry.stop(); st = Failed; if (changed) changed(); }
 
     // --- microphone (pw-record raw s16 48 kHz mono) ---
+    // No node.dont-fallback: with PipeWire 1.6 / WirePlumber 0.5 it makes a capture stream with an
+    // explicit --target fail ("defined target not found") even when the source exists, so nothing
+    // was ever captured. Instead the configured source must exist before we start (so the stream
+    // cannot silently fall back to another mic), and node.dont-reconnect keeps it from moving later.
+    static bool sourceExists(const QString &name) {
+        QProcess p; p.start("pactl", {"list", "short", "sources"});
+        if (!p.waitForFinished(2000)) { p.kill(); p.waitForFinished(200); return true; }   // cannot tell: let pw-record decide
+        for (const QByteArray &l : p.readAllStandardOutput().split('\n')) { const auto f = l.split('\t'); if (f.size() > 1 && f[1] == name.toUtf8()) return true; }
+        return false;
+    }
+    void micNote(const QString &e) {
+        micErr = e;
+        if (e != micErrLogged) { micErrLogged = e; if (!e.isEmpty()) log("mic: " + e); }
+        if (changed) changed();
+    }
     void startMic() {
         if (mic) return;
+        if (!naCfg.micSource.isEmpty() && !sourceExists(naCfg.micSource)) {
+            micNote("source not found: " + naCfg.micSource + " (plugged in? see Settings)");
+            if (st != Off) micRestart.start();
+            return;
+        }
         mic = new QProcess(this);
         QStringList a{"--rate", "48000", "--channels", "1", "--format", "s16", "--latency", "480", "--raw",
                       "-P", "{ node.name = ft710_remote_tx_mic node.description = \"FT-710 Remote TX mic\" media.role = Communication"
-                            + QString(naCfg.micSource.isEmpty() ? "" : " node.dont-fallback = true") + " }"};
+                            + QString(naCfg.micSource.isEmpty() ? "" : " node.dont-reconnect = true") + " }"};
         if (!naCfg.micSource.isEmpty()) a << "--target" << naCfg.micSource;
         a << "-";
-        connect(mic, &QProcess::readyReadStandardOutput, this, [this] { micData(mic->readAllStandardOutput()); });
-        connect(mic, &QProcess::finished, this, [this] {
-            mic->deleteLater(); mic = nullptr; micLevel = -120;
+        connect(mic, &QProcess::readyReadStandardOutput, this, [this] { if (!micErr.isEmpty()) micNote({}); micData(mic->readAllStandardOutput()); });
+        connect(mic, &QProcess::readyReadStandardError, this, [this] {   // pw-record errors go to the log (were dropped before)
+            micErrBuf += mic->readAllStandardError();
+            int nl; while ((nl = micErrBuf.indexOf('\n')) >= 0) { const QString l = QString::fromUtf8(micErrBuf.left(nl)).trimmed(); micErrBuf.remove(0, nl + 1); if (!l.isEmpty()) micNote(l); }
+            if (micErrBuf.size() > 4096) micErrBuf.clear();
+        });
+        connect(mic, &QProcess::finished, this, [this](int code) {
+            mic->deleteLater(); mic = nullptr; micLevel = -120; micErrBuf.clear();
+            if (micErr.isEmpty()) micNote(QString("capture stopped (pw-record exit %1)").arg(code));
             if (ptt && pttLost) { setPtt(false); pttLost("microphone capture stopped"); }
             if (changed) changed();
             if (st != Off) micRestart.start();
@@ -305,6 +338,29 @@ private:
             if (e == QProcess::FailedToStart && mic) { mic->deleteLater(); mic = nullptr; log("pw-record not found"); }
         });
         mic->start("pw-record", a);
+        if (!naCfg.micSource.isEmpty()) QTimer::singleShot(1500, mic, [this] { verifyMicLink(); });
+    }
+    // Make sure the capture stream is linked to the configured source and not a fallback mic.
+    void verifyMicLink() {
+        if (!mic) return;
+        auto *p = new QProcess(this);
+        connect(p, &QProcess::finished, this, [this, p] {
+            const QStringList lines = QString::fromUtf8(p->readAllStandardOutput()).split('\n');
+            p->deleteLater();
+            if (!mic) return;
+            QSet<QString> from; bool in = false;
+            for (const QString &l : lines) {
+                if (!l.startsWith(' ')) { in = l.startsWith("ft710_remote_tx_mic:"); continue; }
+                const int i = l.indexOf("|<- ");
+                if (in && i >= 0) from << l.mid(i + 4).section(':', 0, 0).trimmed();
+            }
+            if (!from.isEmpty() && !from.contains(naCfg.micSource)) {
+                micNote("capturing from " + QStringList(from.values()).join(", ") + " instead of " + naCfg.micSource + " — stopped");
+                mic->kill();   // finished handler retries in 1 s; PTT stays blocked meanwhile
+            }
+        });
+        p->start("pw-link", {"-l"});
+        QTimer::singleShot(3000, p, [p] { if (p->state() != QProcess::NotRunning) p->kill(); });
     }
     void stopLocal() {
         hb.stop(); retry.stop(); guard.stop(); tone.stop(); micRestart.stop();

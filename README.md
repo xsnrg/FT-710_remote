@@ -298,13 +298,17 @@ gate**, pick the **Microphone**, TX gate port and service. Then:
 * **PTT / Space** keys only when the link is ready and TX keying is enabled. The button shows
   TALKING when the gate reports the rig keyed; the RX/TX label comes from flrig. The "TX mic"
   meter shows your level; the TX slider is applied in the gate.
+  PTT is refused (and the meter says *not capturing — PTT blocked*) until the mic is actually
+  capturing; the selected mic must exist (no silent fallback to another input) and pw-record
+  errors are written to the log.
 * **Disconnect** (and quitting) unkeys, stops the gate and starts `radio-bridge` again — only if
   flrig reports PTT 0 ("restore radio-bridge" in Settings). Switching back to Mumble mode always
   restores the bridge.
 
 Gate behaviour: key → 70 ms TX delay → fade in; on release drain, fade out, 0.7 s hang, unkey.
-It unkeys at once on control-connection loss, a heartbeat older than 500 ms, an audio gap over
-200 ms while PTT is held, the 120 s TX timeout (then PTT must be released first), `tx_enabled`
+It unkeys at once on control-connection loss, a heartbeat older than 500 ms, no mic audio within
+2 s of keying (`TG_FIRST_AUDIO_S`), a mid-over audio gap over 2 s (`TG_GAP_S`; silence is played
+during shorter gaps), the 120 s TX timeout (then PTT must be released first), `tx_enabled`
 removed, `radio-bridge` starting, or service stop; `ExecStopPost` unkeys after a crash (only if
 its own keyed marker exists). Settings: `server/ft710-txgate/txgate.env.example`.
 

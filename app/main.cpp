@@ -1062,7 +1062,11 @@ private:
             micBar->setValue(int(qBound(0.0, db + 60, 60.0)));
             micBar->setFormat(QString("%1 dBFS").arg(db, 0, 'f', 0));
             micBar->setStyleSheet(QString("QProgressBar::chunk { background:%1; }").arg(db > -3 ? "#c00" : talking && talkNet ? "#c60" : "#2a2"));
-        } else { micBar->setValue(0); micBar->setFormat("no mic signal"); micBar->setStyleSheet(""); }
+        } else {
+            micBar->setValue(0); micBar->setStyleSheet("");
+            micBar->setFormat(tx->micUp() ? QString("no mic signal") : "not capturing — PTT blocked");
+        }
+        micBar->setToolTip(tx->micProblem());
     }
     void updateTxUi() {
         const bool on = naCfg.txNet();
@@ -1198,6 +1202,7 @@ private:
         if (naCfg.txNet()) {   // direct TX through the TX gate
             if (!tx->ready()) { ptt->setDown(false); note("TX link not ready — " + (tx->active() ? tx->statusText() : QString("Connect first"))); return; }
             if (txState != "on") { ptt->setDown(false); note("TX keying is disabled (Enable TX keying first)"); return; }
+            if (!tx->micUp()) { ptt->setDown(false); note("Not keying — " + tx->micProblem()); return; }
         } else if (!mumbleRunning()) { ptt->setDown(false); mumbleLbl->setText("Mumble not running — Connect first"); return; }
         ptt->setStyleSheet("background:#e90; color:black;");
         ptt->setText("hold…");
@@ -1208,7 +1213,7 @@ private:
         holdTimer.stop();
         if (talking) return;
         if (naCfg.txNet()) {
-            if (!tx->setPtt(true)) { resetPttButton(); note("TX link not ready — not keyed"); return; }
+            if (!tx->setPtt(true)) { resetPttButton(); note(tx->ready() && !tx->micUp() ? "Not keying — " + tx->micProblem() : QString("TX link not ready — not keyed")); return; }
             talking = true; talkNet = true;
             ptt->setStyleSheet("background:#c00; color:white;");
             ptt->setText("TALKING?\n(waiting for the gate)");
@@ -1902,7 +1907,7 @@ static int netaudioCli(QApplication &app, const QStringList &args, int i) {
     return rc;
 }
 
-// Hidden test hook: --txgate-test HOST PORT TOKENFILE HOLD_MS [--opus KBPS] [--mic] [--wait-ms N]
+// Hidden test hook: --txgate-test HOST PORT TOKENFILE HOLD_MS [--opus KBPS] [--mic] [--mic-source NAME] [--wait-ms N]
 // Connects straight to a TX gate (no ssh, nothing started), holds PTT for HOLD_MS with a 700 Hz
 // -20 dBFS test tone (or the configured mic with --mic), releases, prints what the gate reports.
 // Only ever point this at a test gate (fake flrig + null sink): it keys whatever flrig the gate uses.
@@ -1914,6 +1919,7 @@ static int txgateCli(QApplication &app, const QStringList &args, int i) {
     if (!tf.open(QIODevice::ReadOnly)) { out << "txgate-test: cannot read token file" << Qt::endl; return 2; }
     const QByteArray tok = tf.readAll().trimmed();
     naCfg.mode = 2; naCfg.compression = 0;
+    if (int j = args.indexOf("--mic-source"); j >= 0 && j + 1 < args.size()) naCfg.micSource = args[j + 1];
     if (int j = args.indexOf("--opus"); j >= 0 && j + 1 < args.size()) { naCfg.compression = 1; naCfg.opusKbps = args[j + 1].toInt(); }
     const int waitMs = args.indexOf("--wait-ms") >= 0 ? args[args.indexOf("--wait-ms") + 1].toInt() : 2500;
     TxLink tx;
@@ -1927,7 +1933,8 @@ static int txgateCli(QApplication &app, const QStringList &args, int i) {
     enum { Wait, Held, Released } ph = Wait; qint64 relAt = 0; int rc = 1;
     QTimer tick; tick.setInterval(20);
     QObject::connect(&tick, &QTimer::timeout, &app, [&] {
-        if (ph == Wait && tx.ready()) { ph = Held; out << ts() << " PTT down (" << tx.codec() << ")" << Qt::endl; tx.setPtt(true); }
+        if (ph == Wait && tx.ready() && !tx.micUp() && t.elapsed() > 8000) { out << ts() << " mic never came up: " << tx.micProblem() << Qt::endl; app.exit(3); }
+        if (ph == Wait && tx.ready() && tx.micUp()) { ph = Held; out << ts() << " PTT down (" << tx.codec() << ")" << Qt::endl; tx.setPtt(true); }
         if (ph == Held && !tx.pttHeld() && relAt == 0) { relAt = t.elapsed(); ph = Released; out << ts() << " PTT dropped by the link" << Qt::endl; }
         static qint64 downAt = -1; if (ph == Held && downAt < 0) downAt = t.elapsed();
         if (ph == Held && downAt >= 0 && t.elapsed() - downAt >= holdMs) { tx.setPtt(false); ph = Released; relAt = t.elapsed(); out << ts() << " PTT up" << Qt::endl; }

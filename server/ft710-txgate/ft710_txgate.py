@@ -10,8 +10,9 @@ Safety:
   * keys only while <TG_CONFIG_DIR>/tx_enabled exists, radio-bridge is not active and its keyed
     marker is absent, and TG_SAFE is not set
   * key -> TG_TX_DELAY_S (rig T/R switch) -> fade in; on release: drain, fade out, TG_HANG_S, unkey
-  * unkeys immediately on: control connection loss, heartbeat older than TG_HB_TIMEOUT_S, audio
-    gap over TG_GAP_S while PTT is held, TG_TX_TIMEOUT_S, tx_enabled removed, radio-bridge
+  * unkeys immediately on: control connection loss, heartbeat older than TG_HB_TIMEOUT_S, no mic
+    audio within TG_FIRST_AUDIO_S of keying or a mid-stream audio gap over TG_GAP_S while PTT is
+    held (silence is played during a shorter gap, never stale audio), TG_TX_TIMEOUT_S, tx_enabled removed, radio-bridge
     starting, SIGTERM/SIGINT/SIGHUP. After a TX timeout PTT must be released before re-keying.
   * while keyed a marker file exists (TG_MARK); `--unkey-if-marked` (systemd ExecStopPost) unkeys
     after a crash or SIGKILL and only when that marker exists, so it never unkeys fldigi etc.
@@ -54,7 +55,8 @@ PREBUF_S = _f("TG_PREBUF_S", None, "0.04")
 LEAD_S = _f("TG_LEAD_S", "RB_LEAD_S", "0.06")
 MAX_BUF_S = _f("TG_MAX_BUF_S", None, "0.3")
 HB_TIMEOUT_S = _f("TG_HB_TIMEOUT_S", None, "0.5")
-GAP_S = _f("TG_GAP_S", None, "0.2")
+GAP_S = _f("TG_GAP_S", None, "2.0")              # mid-stream audio gap while PTT is held
+FIRST_AUDIO_S = _f("TG_FIRST_AUDIO_S", None, "2.0")   # first mic packet after keying
 PA_LATENCY_MS = int(E("TG_PA_LATENCY_MS", "60"))
 TX_GAIN_DEFAULT = float(E("RB_TX_GAIN", "1.0"))
 RATE, TX_FRAME = 48000, 480          # 48 kHz mono s16le, 10 ms write unit
@@ -437,8 +439,10 @@ class Gate:
         elif now - self.t_key > TX_TIMEOUT_S: why = "TX timeout (%.0f s)" % TX_TIMEOUT_S; self.latched = "TX timeout: release PTT"
         elif not f["tx_enabled"]: why = "TX keying turned off"
         elif f["bridge"]: why = "radio-bridge started"
-        elif ptt and now - max(self.last_pkt, self.t_key) > GAP_S:
-            why = "mic audio gap over %.0f ms" % (GAP_S * 1000)
+        elif ptt and self.last_pkt < self.t_key and now - self.t_key > FIRST_AUDIO_S:
+            why = "no mic audio within %.1f s of keying" % FIRST_AUDIO_S
+        elif ptt and self.last_pkt >= self.t_key and now - self.last_pkt > GAP_S:
+            why = "mic audio gap over %.1f s" % GAP_S
         if why:
             return self._unkey(why)
         if ptt:
@@ -699,8 +703,8 @@ def main():
     net = Net(gate, load_token())
     net.start()
     threading.Thread(target=poll_rig, args=(gate, rig), daemon=True).start()
-    log.info("listening on %s:%d tcp+udp (allow %s) sink=%s flrig=%s safe=%s hang=%.2fs timeout=%.0fs",
-             BIND, PORT, ",".join(map(str, ALLOW)), SINK or "-", FLRIG_URL, SAFE, HANG_S, TX_TIMEOUT_S)
+    log.info("listening on %s:%d tcp+udp (allow %s) sink=%s flrig=%s safe=%s hang=%.2fs timeout=%.0fs first_audio=%.1fs gap=%.1fs",
+             BIND, PORT, ",".join(map(str, ALLOW)), SINK or "-", FLRIG_URL, SAFE, HANG_S, TX_TIMEOUT_S, FIRST_AUDIO_S, GAP_S)
     last = time.monotonic()
     try:
         while not stop.is_set():
