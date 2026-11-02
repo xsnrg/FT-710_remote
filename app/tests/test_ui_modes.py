@@ -2,7 +2,7 @@
 """Regression test for the RX controls per audio mode (offscreen, throwaway settings dir).
 
 Also: the network RX gain slider (shown only in network mode, default +9.5 dB = 3x, saved value
-shown, the stored 3.0 not rewritten just by starting) and the band scope's "Snap to kHz" checkbox
+shown, the stored 3.0 not rewritten just by starting) and the band scope's click-to-tune options ("Snap to" step, SSB offset)
 (default on, saved setting honoured, greyed out when click-to-tune is off).
 
 Direct-TX mode must not show Mumble's (always disabled there) RX volume slider, must keep the
@@ -80,14 +80,27 @@ check("saved RX gain 0.5x shows -6.0 dB (slider min)", "value=-60" in line(lines
 lines, _ = run(NA % ("false", "true") + "rxGain=99\n")
 check("out-of-range RX gain is clamped to 10x", "value=200" in line(lines, "slider:", "RX gain"), line(lines, "slider:", "RX gain"))
 
-# Snap to kHz (scope shown by default; offscreen it can't connect, but the controls exist)
-lines, _ = run("")
-l = line(lines, "checkbox:", "Snap to kHz")
-check("Snap to kHz: present and on by default", "[checked]" in l and "[disabled]" not in l, l)
+# Click-to-tune options: "Snap to [0.5 kHz|1 kHz]" and SSB offset (scope shown by default; offscreen it can't connect, but the controls exist)
+lines, saved = run("")
+l = line(lines, "checkbox:", "Snap to")
+check("Snap to: present and on by default", "[checked]" in l and "[disabled]" not in l, l)
+l = line(lines, "combo:", "Snap step")
+check("snap step: defaults to 0.5 kHz, enabled", "current=0.5 kHz" in l and "[disabled]" not in l, l)
+l = line(lines, "spinbox:", "SSB signal")
+check("SSB offset: defaults to 1500 Hz, enabled", "value=1500" in l and "[disabled]" not in l, l)
+check("starting doesn't rewrite snap step / offset", "scopeSnapStep" not in saved and "scopeSsbOffset" not in saved)
 lines, _ = run("[General]\nscopeSnapKHz=false\n")
-check("Snap to kHz: saved off is honoured", (l := line(lines, "checkbox:", "Snap to kHz")) != "" and "[checked]" not in l, l)
+check("Snap to: saved off is honoured", (l := line(lines, "checkbox:", "Snap to")) != "" and "[checked]" not in l, l)
+check("snap step: disabled when Snap is off", "[disabled]" in line(lines, "combo:", "Snap step"), line(lines, "combo:", "Snap step"))
+lines, _ = run("[General]\nscopeSnapStep=1000\nscopeSsbOffset=1200\n")
+check("snap step: saved 1 kHz is honoured", "current=1 kHz" in line(lines, "combo:", "Snap step"), line(lines, "combo:", "Snap step"))
+check("SSB offset: saved 1200 Hz is honoured", "value=1200" in line(lines, "spinbox:", "SSB signal"), line(lines, "spinbox:", "SSB signal"))
+lines, _ = run("[General]\nscopeSnapStep=123\nscopeSsbOffset=9999\n")
+check("snap step: junk falls back to 0.5 kHz", "current=0.5 kHz" in line(lines, "combo:", "Snap step"), line(lines, "combo:", "Snap step"))
+check("SSB offset: out of range clamped to 3000", "value=3000" in line(lines, "spinbox:", "SSB signal"), line(lines, "spinbox:", "SSB signal"))
 lines, _ = run("[General]\nscopeClickTune=false\n")
-check("Snap to kHz: disabled when click-to-tune is off", "[disabled]" in line(lines, "checkbox:", "Snap to kHz"), line(lines, "checkbox:", "Snap to kHz"))
+check("click-to-tune off: Snap/step/offset disabled",
+      all("[disabled]" in line(lines, k, c) for k, c in (("checkbox:", "Snap to"), ("combo:", "Snap step"), ("spinbox:", "SSB signal"))))
 
 bad = [n for n, ok in RESULTS if not ok]
 print("\n%d/%d passed" % (len(RESULTS) - len(bad), len(RESULTS)) + ("; FAILED: " + ", ".join(bad) if bad else ""))

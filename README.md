@@ -27,8 +27,15 @@ It has two halves:
   internal FTDI FT4222 USB-to-SPI bridge, which appears on USB only when
   **MENU → SCU-LAN10 = ON**. The client shows spectrum + waterfall, with span and
   reference-level / auto-contrast controls, and **click-to-tune** (sets VFO-A via flrig;
-  frequency only). **Snap to kHz** (on by default) rounds a click to the nearest whole kHz
-  (3.788678 → 3.789000 MHz); off, it rounds to 10/100/500 Hz depending on the span.
+  frequency only). Click the *middle of the signal* you want: in SSB the dial frequency is the
+  suppressed carrier, so the click is mode-aware – **LSB / DATA-L: dial = click + SSB offset**,
+  **USB / DATA-U: dial = click − SSB offset** (default 1500 Hz, the middle of the 300–2700 Hz
+  passband; 0 = always direct). CW (the FT-710 shows the received carrier), AM, FM, RTTY and
+  PSK tune directly to the click. **Snap to [0.5 kHz | 1 kHz]** (on, 0.5 kHz by default)
+  then rounds the final dial frequency: an LSB click on 3.788678 → 3.790178 → **3.790000 MHz**;
+  with Snap off it rounds to 10/100/500 Hz depending on the span. While hovering, the readout
+  shows `cursor … → dial … (LSB +1.5 kHz)` and an outline shows where the passband will land.
+  Settings: `scopeSnapKHz`, `scopeSnapStep` (500/1000), `scopeSsbOffset` (0–3000 Hz).
 * **Network audio (optional, receive only)** – instead of hearing the radio only through
   Mumble, the rig host streams the radio's receive audio straight to the desktop with
   PipeWire (ROC with FEC, or RTP; optional Opus compression for VPN use). It appears as the

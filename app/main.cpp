@@ -310,7 +310,11 @@ public:
     std::function<bool()> canTune;               // false while transmitting
     std::function<void(int)> onSpanCode;         // span code (0-9) from the frame header, when it changes
     bool clickToTune = true;
-    bool snapKHz = true;   // "Snap to kHz": click-to-tune lands on the nearest whole kHz
+    bool snap = true;            // "Snap to": round the dial frequency a click tunes to ...
+    double snapStepHz = 500;     // ... to this step (500 / 1000 Hz)
+    double ssbOffsetHz = 1500;   // LSB/USB: the clicked point lands this far into the passband (dial = click ± offset)
+    // The dial (VFO) frequency a click at x would tune to, for the rig's current mode (from the scope frame).
+    double dialForX(double x) const { return clickDialHz(freqAt(x), mode, ssbOffsetHz, span, snap ? snapStepHz : 0); }
     bool autoContrast = false;                   // off: fixed colour scale, so the radio's scope LEVEL shows
     int lastSpanCode = -1;
 
@@ -385,7 +389,12 @@ protected:
             top = QString("%1 kHz span%2").arg(span / 1000.0, 0, 'g', 4).arg(fixedEdge ? " (fixed)" : "");
             if (hoverX >= 0) {
                 top += QString("   cursor %1 MHz").arg(freqAt(hoverX) / 1e6, 0, 'f', 4);
-                if (clickToTune && snapKHz) top += QString(" → %1").arg(clickTuneHz(freqAt(hoverX), span, true) / 1e6, 0, 'f', 3);
+                if (clickToTune) {
+                    const double d = dialForX(hoverX);
+                    top += QString(" → dial %1").arg(d / 1e6, 0, 'f', (snap && snapStepHz >= 1000) ? 3 : 4);
+                    if (tuneSide(mode) && ssbOffsetHz > 0)
+                        top += QString(" (%1 %2%3 kHz)").arg(tuneSideName(mode)).arg(tuneSide(mode) < 0 ? "+" : "−").arg(ssbOffsetHz / 1000.0, 0, 'g', 3);
+                }
             }
             if (clickToTune) top += (canTune && !canTune()) ? "   (tuning disabled while TX)" : "   click to tune";
         }
@@ -393,6 +402,16 @@ protected:
         if (hoverX >= 0 && span > 0 && status.isEmpty()) {
             p.setPen(QPen(QColor(255, 255, 255, 110), 1, Qt::DashLine));
             p.drawLine(QPointF(hoverX, area.top()), QPointF(hoverX, area.bottom()));
+            // where a click would put the dial and the passband (outline), so the signal under the cursor sits inside it
+            if (clickToTune && (!canTune || canTune())) {
+                const double d = dialForX(hoverX);
+                auto [a, b] = passband();
+                if (d > 0 && b > a) {
+                    p.setPen(QPen(QColor(255, 200, 80, 170), 1, Qt::DashLine)); p.setBrush(Qt::NoBrush);
+                    p.drawRect(QRectF(QPointF(xOf(d + a), area.top() + 1), QPointF(xOf(d + b), area.bottom() - 1)));
+                }
+                if (d > 0) { p.setPen(QPen(QColor(255, 140, 60, 200), 1, Qt::DotLine)); p.drawLine(QPointF(xOf(d), area.top()), QPointF(xOf(d), area.bottom())); }
+            }
         }
     }
     void mouseMoveEvent(QMouseEvent *e) override { hoverX = e->position().x(); update(); }
@@ -403,7 +422,7 @@ protected:
         if (e->button() != Qt::LeftButton || !clickToTune || span <= 0 || !status.isEmpty()) return;
         if ((e->position() - pressPos).manhattanLength() > 6) return;
         if (canTune && !canTune()) return;
-        const double hz = clickTuneHz(freqAt(e->position().x()), span, snapKHz);   // whole kHz, or a step that suits the span
+        const double hz = dialForX(e->position().x());   // mode-aware (SSB offset), then snapped
         if (onTune && hz > 0) onTune(hz);
     }
 
@@ -649,10 +668,21 @@ public:
         scopeTuneChk = new QCheckBox("Click to tune");
         scopeTuneChk->setToolTip("A single left click in the scope sets VFO-A to that frequency through flrig "
                                  "(rig.set_vfo). Disabled while transmitting. Never keys the radio.");
-        scopeSnapChk = new QCheckBox("Snap to kHz");
-        scopeSnapChk->setToolTip("Click to tune rounds to the nearest whole kHz (3.788678 MHz → 3.789000 MHz). "
-                                 "Off: rounds to 10/100/500 Hz depending on the span.");
-        scopeRow->addWidget(scopeChk); scopeRow->addWidget(scopeTuneChk); scopeRow->addWidget(scopeSnapChk); scopeRow->addStretch(1);
+        // Click-to-tune options: snap step and SSB offset (LSB: dial = click + offset, USB: dial = click − offset)
+        scopeTuneOpts = new QWidget; auto *to = new QHBoxLayout(scopeTuneOpts); to->setContentsMargins(0, 0, 0, 0);
+        scopeSnapChk = new QCheckBox("Snap to");
+        scopeSnapChk->setToolTip("Round the dial frequency a click tunes to (after the SSB offset) to the step on the right. "
+                                 "Off: 10/100/500 Hz depending on the span.");
+        scopeSnapStep = new QComboBox; scopeSnapStep->addItem("0.5 kHz", 500); scopeSnapStep->addItem("1 kHz", 1000);
+        scopeSnapStep->setToolTip("Snap step for click to tune (applied to the final dial frequency)");
+        auto *offLbl = new QLabel("SSB offset");
+        scopeSsbOff = new QSpinBox; scopeSsbOff->setRange(0, 3000); scopeSsbOff->setSingleStep(100); scopeSsbOff->setSuffix(" Hz");
+        scopeSsbOff->setToolTip("Click the middle of an SSB signal and it lands this far into the passband: LSB/DATA-L "
+                                "dial = click + offset, USB/DATA-U dial = click − offset (1500 Hz = middle of 300–2700 Hz). "
+                                "CW, AM, FM, RTTY: the click is the dial frequency. 0 = always direct.");
+        offLbl->setToolTip(scopeSsbOff->toolTip());
+        to->addWidget(scopeSnapChk); to->addWidget(scopeSnapStep); to->addSpacing(8); to->addWidget(offLbl); to->addWidget(scopeSsbOff);
+        scopeRow->addWidget(scopeChk); scopeRow->addWidget(scopeTuneChk); scopeRow->addWidget(scopeTuneOpts); scopeRow->addStretch(1);
         v->addLayout(scopeRow);
         // Scope SPAN and LEVEL on the radio (CAT SS05 / SS04 via flrig rig.cat_string: display settings only)
         scopeCtl = new QWidget;
@@ -708,14 +738,24 @@ public:
             scopeTuneChk->setChecked(st.value("scopeClickTune", true).toBool());
             scope->clickToTune = scopeTuneChk->isChecked();
             scopeSnapChk->setChecked(st.value("scopeSnapKHz", true).toBool());
-            scope->snapKHz = scopeSnapChk->isChecked();
-            scopeSnapChk->setEnabled(scope->clickToTune);
+            scope->snap = scopeSnapChk->isChecked();
+            const int stepHz = st.value("scopeSnapStep", 500).toInt() == 1000 ? 1000 : 500;
+            scopeSnapStep->setCurrentIndex(stepHz == 1000 ? 1 : 0); scope->snapStepHz = stepHz;
+            scopeSnapStep->setEnabled(scope->snap);
+            scopeSsbOff->setValue(qBound(0, st.value("scopeSsbOffset", 1500).toInt(), 3000)); scope->ssbOffsetHz = scopeSsbOff->value();
+            scopeTuneOpts->setEnabled(scope->clickToTune);
             scopeChk->setChecked(st.value("showScope", true).toBool());
         }
         connect(scopeTuneChk, &QCheckBox::toggled, this, [this](bool on) {
-            QSettings().setValue("scopeClickTune", on); scope->clickToTune = on; scopeSnapChk->setEnabled(on); scope->update();
+            QSettings().setValue("scopeClickTune", on); scope->clickToTune = on; scopeTuneOpts->setEnabled(on); scope->update();
         });
-        connect(scopeSnapChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("scopeSnapKHz", on); scope->snapKHz = on; scope->update(); });
+        connect(scopeSnapChk, &QCheckBox::toggled, this, [this](bool on) {
+            QSettings().setValue("scopeSnapKHz", on); scope->snap = on; scopeSnapStep->setEnabled(on); scope->update();
+        });
+        connect(scopeSnapStep, &QComboBox::currentIndexChanged, this, [this](int) {
+            const int hz = scopeSnapStep->currentData().toInt(); QSettings().setValue("scopeSnapStep", hz); scope->snapStepHz = hz; scope->update();
+        });
+        connect(scopeSsbOff, &QSpinBox::valueChanged, this, [this](int hz) { QSettings().setValue("scopeSsbOffset", hz); scope->ssbOffsetHz = hz; scope->update(); });
         connect(scopeChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("showScope", on); showScope(on); });
         showScope(scopeChk->isChecked());
 
@@ -878,7 +918,7 @@ private:
 private:
     QPushButton *connectBtn, *disconnectBtn, *ptt, *txBtn, *restartBtn;
     // --- band scope ---
-    QCheckBox *scopeChk, *scopeTuneChk, *scopeSnapChk;
+    QCheckBox *scopeChk, *scopeTuneChk, *scopeSnapChk; QWidget *scopeTuneOpts; QComboBox *scopeSnapStep; QSpinBox *scopeSsbOff;
     ScopeWidget *scope;
     bool radioRx = false;          // flrig last reported PTT=0 (tuning by click is only allowed then)
     QProcess *tuneProc = nullptr;
@@ -947,7 +987,7 @@ private:
     void showScope(bool on) {
         if (geomReady) { geomSave.stop(); saveGeom(on ? 0 : 1); }   // remember the size for the state we're leaving
         const bool remembered = geomReady && !QSettings().value(geomKey(on)).toByteArray().isEmpty();
-        scope->setVisible(on); scopeTuneChk->setVisible(on); scopeSnapChk->setVisible(on); scopeCtl->setVisible(on);
+        scope->setVisible(on); scopeTuneChk->setVisible(on); scopeTuneOpts->setVisible(on); scopeCtl->setVisible(on);
         if (remembered) QTimer::singleShot(0, this, [this] { restoreSavedGeometry(); });
         if (on) { queryLevel(); lvlPoll.start(); } else lvlPoll.stop();
         if (on) {
@@ -2024,7 +2064,8 @@ int main(int argc, char **argv) {
           << " dest=" << (naCfg.destAddr.isEmpty() ? "auto" : naCfg.destAddr) << " keepOnExit=" << naCfg.keepOnExit
           << " listen=" << (naCfg.listenMute ? "muted" : QString::number(naCfg.listenVol) + "%")
           << " rxGain=" << QString::number(naCfg.rxGain, 'f', 2) << "x (" << QString::number(NetAudioCfg::gainDb(naCfg.rxGain), 'f', 1) << " dB)"
-          << " clickTune=" << QSettings().value("scopeClickTune", true).toBool() << " snapKHz=" << QSettings().value("scopeSnapKHz", true).toBool()
+          << " clickTune=" << QSettings().value("scopeClickTune", true).toBool() << " snap=" << QSettings().value("scopeSnapKHz", true).toBool()
+          << " snapStep=" << QSettings().value("scopeSnapStep", 500).toInt() << " ssbOffset=" << QSettings().value("scopeSsbOffset", 1500).toInt()
           << "\ntx=" << (naCfg.txNet() ? "tx-gate" : "mumble") << " gatePort=" << naCfg.txPort << " unit=" << naCfg.txUnit
           << " mic=" << (naCfg.micSource.isEmpty() ? "default" : naCfg.micSource) << " restoreBridge=" << naCfg.restoreBridge
           << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate())
@@ -2078,6 +2119,10 @@ int main(int argc, char **argv) {
             for (auto *b : w.findChildren<QToolButton *>()) out << "toolbutton: " << b->text() << (b->isEnabled() ? "" : " [disabled]") << (b->isVisible() ? "" : " [hidden]") << "\n";
             for (auto *sl : w.findChildren<QSlider *>()) out << "slider: " << sl->toolTip().left(40) << " value=" << sl->value()
                                                             << (sl->isEnabled() ? "" : " [disabled]") << (sl->isVisible() ? "" : " [hidden]") << "\n";
+            for (auto *c : w.findChildren<QComboBox *>()) out << "combo: " << c->toolTip().left(40) << " current=" << c->currentText()
+                                                              << (c->isEnabled() ? "" : " [disabled]") << (c->isVisible() ? "" : " [hidden]") << "\n";
+            for (auto *sb : w.findChildren<QSpinBox *>()) out << "spinbox: " << sb->toolTip().left(40) << " value=" << sb->value()
+                                                              << (sb->isEnabled() ? "" : " [disabled]") << (sb->isVisible() ? "" : " [hidden]") << "\n";
             for (auto *c : w.findChildren<QCheckBox *>()) out << "checkbox: " << c->text() << (c->isChecked() ? " [checked]" : "")
                                                               << (c->isEnabled() ? "" : " [disabled]") << (c->isVisible() ? "" : " [hidden]") << "\n";
             app.quit();
