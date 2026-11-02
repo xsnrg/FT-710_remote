@@ -54,6 +54,11 @@ l = line(lines, "slider:", "listen monitor")
 check("defaults: listen slider shown and enabled", l != "" and "[disabled]" not in l and "[hidden]" not in l, l)
 check("defaults: Listen is on", line(lines, "toolbutton:", "Listen: on") != "", line(lines, "toolbutton:", "Listen:"))
 check("defaults: no Mumble / murmur / radio-bridge anywhere in the UI", not no_mumble(lines), "; ".join(no_mumble(lines)))
+btns = [l for l in lines if l.startswith("button:")]
+check("defaults: CAT reset button next to Settings", any(l.startswith("button: CAT reset") for l in btns), "; ".join(btns))
+check("defaults: no separate Connect / Disconnect buttons (Start/Stop does both)",
+      not any(l.split(" [")[0] in ("button: Connect", "button: Disconnect") for l in btns) and any(l.startswith("button: Start") for l in btns),
+      "; ".join(btns))
 check("defaults: RX stream combo is ROC", "current=ROC" in line(lines, "combo:", "rig host sends"), line(lines, "combo:", "rig host sends"))
 
 lines, saved = run(NA % "true")

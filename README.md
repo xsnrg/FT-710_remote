@@ -169,9 +169,9 @@ once on first start; keys already present are not overwritten.
 The stream itself is **receive only**; transmit goes through the [TX gate](#tx-gate).
 
 How it works:
-* **Connect** starts the stream and the TX gate, **Disconnect** stops both, and the stream is
-  stopped when the app quits (unless "keep streaming" is ticked). The **Start/Stop** button in
-  the "RX network" row controls the stream on its own.
+* **Start** (the button in the "RX network" row) starts the stream and the TX gate, **Stop**
+  stops both, and the stream is stopped when the app quits (unless "keep streaming" is ticked).
+  There are no separate Connect/Disconnect buttons any more; Start/Stop does both.
 * The app writes the configs from built-in templates and runs them as systemd **user** units:
   `ft710-netaudio-recv` locally (config in `~/.config/FT-710_remote/netaudio/`) and
   `ft710-netaudio-send` on the rig host over ssh (config in `~/.config/ft710-netaudio/`).
@@ -275,7 +275,7 @@ radio's USB audio input (`RB_SINK` / `TG_SINK`) and the only thing that keys flr
           mic (pactl source) ── UDP 10010 RTP ───────▶            └─ pacat ──▶ FT-710 USB audio
 ```
 
-Rig-host install (do **not** enable it; the app starts it when you Connect):
+Rig-host install (do **not** enable it; the app starts it when you press Start):
 
 ```sh
 mkdir -p ~/ft710-txgate ~/.config/ft710-txgate
@@ -293,7 +293,7 @@ it over ssh and never stores it.
 
 Client: **Settings → Network audio / TX** → pick the **Microphone**, TX gate port and service. Then:
 
-* **Connect** checks flrig PTT is 0 and no keyed marker exists, starts `ft710-txgate`, reads the
+* **Start** checks flrig PTT is 0 and no keyed marker exists, starts `ft710-txgate`, reads the
   token and connects. The "TX gate" status row shows the link state; reconnects use 1/2/5/10 s
   backoff and never re-key by themselves.
 * **PTT / Space** keys only when the link is ready and TX keying is enabled. The button shows
@@ -302,7 +302,33 @@ Client: **Settings → Network audio / TX** → pick the **Microphone**, TX gate
   PTT is refused (and the meter says *not capturing — PTT blocked*) until the mic is actually
   capturing; the selected mic must exist (no silent fallback to another input) and pw-record
   errors are written to the log.
-* **Disconnect** (and quitting) unkeys and stops the gate and the stream.
+* **Stop** (and quitting) unkeys and stops the gate and the stream.
+
+### CAT reset
+
+The **CAT reset** button (bottom row, next to Settings…) power-cycles the FT-710 over its own CAT
+serial port on the rig host, bypassing flrig — for a hung rig or flrig, as long as the radio still
+accepts CAT. After a confirmation ("Power-cycle the FT-710 over CAT? flrig will be restarted.")
+the TX gate (`ft710_txgate.py`, the same helper and auth on `TG_PORT`) runs it in its own
+transient user unit (`ft710-catreset-<time>`), so it finishes even if the app or the gate stops:
+
+1. refuse while the gate has the rig keyed or PTT is held in the app (flrig's PTT is only logged:
+   a PTT stuck by flrig or the radio is one of the reasons to reset);
+2. find flrig (desktop app or user unit) and stop it with SIGTERM, wait until the port is free;
+3. open the CAT port from flrig's prefs (or the CP2105 `if00` by-id port) at the prefs' baud, 8N1;
+4. `PS;` → `PS0;`, wait ~3 s and confirm the radio no longer answers;
+5. `;` then `PS1;` within 1 s, wait ~10 s, verify `PS1;` and `TX0;`;
+6. restart flrig the way it was running (desktop app → `systemd-run --user` in the graphical
+   session with its original environment; unit → `systemctl --user start`), and report each step.
+
+Only `PS;`, `PS0;`, `PS1;`, `TX;` and `;` can be written — never `TX1` or any key command. The
+button is disabled while it runs; progress goes to the status line and the log. If the gate is
+not running (not started, or it refuses because PTT is stuck) the app runs the same code over
+ssh instead. On the rig host: `python3 ~/ft710-txgate/ft710_txgate.py --cat-reset --dry-run`
+checks everything without stopping flrig or sending anything.
+
+Note: flrig's `restore_*` settings make it write back the radio state it found at startup when it
+closes, so the frequency/mode after a reset may be what flrig started with.
 
 Gate behaviour: key → 70 ms TX delay → fade in; on release drain, fade out, 0.7 s hang, unkey.
 It unkeys at once on control-connection loss, a heartbeat older than 500 ms, no mic audio within

@@ -48,6 +48,7 @@ public:
     std::function<void()> changed;                    // any visible state change
     std::function<void(const QString &)> logLine;
     std::function<void(const QString &)> pttLost;     // PTT was held and the link dropped / gate unkeyed
+    std::function<void(const QString &)> catEvent;    // "catreset: ..." / "catreset-done ok|fail ..." from the gate
 
     explicit TxLink(QObject *parent = nullptr) : QObject(parent) {
         hb.setInterval(100);
@@ -140,6 +141,13 @@ public:
             connect(p, &QProcess::finished, this, [this, p] { log("stop: " + QString::fromUtf8(p->readAllStandardOutput()).simplified()); p->deleteLater(); if (changed) changed(); });
             QTimer::singleShot(15000, p, [p] { if (p->state() != QProcess::NotRunning) p->kill(); });
         }
+    }
+    // CAT reset (power-cycle the FT-710 over CAT, bypassing flrig): the gate runs it in its own unit and
+    // answers with EVENT "catreset: ..." progress and "catreset-done ok|fail <summary>". Never while PTT is held.
+    bool sendCatReset(bool dry) {
+        if (st != Ready || ptt) return false;
+        sendLine(dry ? "CATRESET DRY" : "CATRESET");
+        return true;
     }
     // PTT: true only if the link is ready (the gate decides whether it actually keys).
     bool setPtt(bool on) {
@@ -252,6 +260,9 @@ private:
                 for (const QString &kv : line.mid(6).split(' ', Qt::SkipEmptyParts)) { const int i = kv.indexOf('='); if (i > 0) gst[kv.left(i)] = kv.mid(i + 1); }
                 if (ptt && wasKeyed && !gateKeyed() && pttLost) pttLost("the TX gate unkeyed: " + (event.isEmpty() ? QString("see status") : event));
                 if (changed) changed();
+            } else if (line.startsWith("EVENT catreset")) {
+                log("gate: " + line.mid(6));
+                if (catEvent) catEvent(line.mid(6));
             } else if (line.startsWith("EVENT ")) {
                 event = line.mid(6); evAge.start(); log("gate: " + event);
                 if (changed) changed();

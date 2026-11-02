@@ -52,6 +52,7 @@ add_test(NAME rxlimit COMMAND test_rxlimit ${RXLIMIT_SO})
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME ui_modes COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_modes.py $<TARGET_FILE:ft710-remote>)
+    add_test(NAME txgate_catreset COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../server/ft710-txgate/test_catreset.py)
 endif()
 # hover preview == stripe after the click, preview centred on the cursor, axis uses the radio's scope centre
 add_test(NAME scope_preview COMMAND $<TARGET_FILE:ft710-remote> --scope-selftest)

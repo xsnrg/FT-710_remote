@@ -20,7 +20,10 @@ Safety:
 Control protocol (TCP, one line per message, UTF-8):
   server: "FT710-TXGATE 1 <nonce>"          client: "AUTH <hex HMAC-SHA256(token, nonce)>"
   server: "OK" | "ERR <why>" (then closes)
-  client: "HB" (every ~100 ms; any line counts), "PTT 1", "PTT 0", "BYE"
+  client: "HB" (every ~100 ms; any line counts), "PTT 1", "PTT 0", "BYE",
+          "CATRESET" / "CATRESET DRY" (power-cycle the FT-710 over CAT, bypassing flrig; refused
+          while keyed or PTT is held; progress as EVENT "catreset: ...", end as EVENT
+          "catreset-done ok|fail <summary>"). Same thing from a shell: --cat-reset [--dry-run]
   server: "STATE k=v ..." (every 250 ms and on change), "EVENT <text>"
 Audio (UDP, same port): RTP, PT 96 = L16/48000/1 (network byte order), PT 97 = Opus/48000/1,
 accepted only from the authenticated controller's address. A new authenticated controller
@@ -244,6 +247,411 @@ def bridge_active():
         return True          # can't tell: assume it is, so we don't fight it
 
 
+# ---------------------------------------------------------------------------------------------
+# CAT reset: power-cycle the FT-710 straight over its CAT serial port, bypassing flrig (for a rig
+# that is stuck while CAT still answers). flrig owns the port, so it is stopped (SIGTERM, or
+# systemctl --user stop when it runs as a real unit), the port is used directly, and flrig is then
+# started again the way it was running. Only these CAT strings are ever written (never TX1 / key):
+CAT_ALLOWED = (b"PS;", b"PS0;", b"PS1;", b"TX;", b";")
+FLRIG_PREFS = os.path.expanduser(E("TG_FLRIG_PREFS", os.path.join(HOME, ".flrig", "FT-710.prefs")))
+CAT_PORT = E("TG_CAT_PORT", "")              # override the port from flrig's prefs
+CAT_BY_ID_GLOB = E("TG_CAT_GLOB", "/dev/serial/by-id/*CP2105*if00-port0")
+CAT_LOCK = os.path.expanduser(E("TG_CAT_LOCK", os.path.join(HOME, ".cache", "ft710-txgate", "catreset.lock")))
+CAT_OFF_WAIT_S = float(E("TG_CAT_OFF_WAIT_S", "3"))
+CAT_BOOT_WAIT_S = float(E("TG_CAT_BOOT_WAIT_S", "10"))
+CAT_BOOT_MAX_S = float(E("TG_CAT_BOOT_MAX_S", "25"))
+FLRIG_STOP_S = float(E("TG_FLRIG_STOP_S", "15"))
+FLRIG_UP_S = float(E("TG_FLRIG_UP_S", "20"))
+FLRIG_NAME = E("TG_FLRIG_NAME", "flrig")       # process name (comm) to look for
+GUI_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+           "XDG_SESSION_TYPE", "HOME", "LANG", "PATH")
+BAUD_TABLE = (300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800)
+
+
+class CatError(Exception):
+    pass
+
+
+def read_flrig_prefs(path=FLRIG_PREFS):
+    """flrig prefs: 'key:value' lines; long values continue on lines starting with '+'."""
+    out, last = {}, None
+    try:
+        lines = open(path, errors="replace").read().splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        if ln.startswith("+") and last is not None:
+            out[last] += ln[1:]
+        elif ":" in ln:
+            k, v = ln.split(":", 1)
+            out[k.strip()] = v.strip()
+            last = k.strip()
+    return out
+
+
+def cat_settings(prefs, port_override=CAT_PORT, by_id_glob=CAT_BY_ID_GLOB):
+    """(port, baud, stopbits, source) from an override, flrig's prefs, or the CP2105 if00 by-id port."""
+    import glob
+    baud, stop = 38400, 1
+    try:
+        i = int(prefs.get("serial_baudrate", ""))
+        if 0 <= i < len(BAUD_TABLE):
+            baud = BAUD_TABLE[i]
+    except ValueError:
+        pass
+    if prefs.get("serial_stopbits") == "2":
+        stop = 2
+    if port_override:
+        return port_override, baud, stop, "TG_CAT_PORT"
+    p = prefs.get("xcvr_serial_port", "")
+    if p and p != "NONE":
+        return p, baud, stop, "flrig prefs"
+    g = sorted(glob.glob(by_id_glob))
+    if g:
+        return g[0], baud, stop, "by-id"
+    raise CatError("no CAT port: not in flrig prefs and no %s" % by_id_glob)
+
+
+def port_holders(port):
+    """pids (other than ours) that have the serial port open."""
+    try:
+        real = os.path.realpath(port)
+    except OSError:
+        return []
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == os.getpid():
+            continue
+        try:
+            for fd in os.listdir("/proc/%s/fd" % d):
+                try:
+                    if os.readlink("/proc/%s/fd/%s" % (d, fd)) == real:
+                        pids.append(int(d)); break
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return pids
+
+
+class CatPort:
+    """Raw 8N1/8N2 termios serial port; only CAT_ALLOWED strings can be written."""
+    def __init__(self, path, baud=38400, stopbits=1):
+        import termios
+        self.path = path
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as e:
+            raise CatError("cannot open %s: %s" % (path, e.strerror))
+        try:
+            import fcntl
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            raise CatError("CAT port busy (locked by another program)")
+        sp = getattr(termios, "B%d" % baud, None)
+        if sp is None:
+            os.close(self.fd); raise CatError("unsupported baud %d" % baud)
+        a = termios.tcgetattr(self.fd)
+        a[0] = 0                                    # iflag: raw
+        a[1] = 0                                    # oflag
+        a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | (termios.CSTOPB if stopbits == 2 else 0)
+        a[3] = 0                                    # lflag: no echo/canonical
+        a[4] = a[5] = sp
+        a[6][termios.VMIN], a[6][termios.VTIME] = 0, 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, a)
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+
+    def write(self, cmd):
+        if cmd not in CAT_ALLOWED:
+            raise CatError("refusing to send %r" % cmd)
+        os.write(self.fd, cmd)
+
+    def read_reply(self, timeout):
+        """Bytes up to and including the first ';', or whatever arrived before the timeout."""
+        buf, end = b"", time.monotonic() + timeout
+        while time.monotonic() < end:
+            r = selectors.DefaultSelector()
+            r.register(self.fd, selectors.EVENT_READ)
+            ev = r.select(max(0.0, end - time.monotonic()))
+            r.close()
+            if ev:
+                try:
+                    d = os.read(self.fd, 64)
+                except BlockingIOError:
+                    d = b""
+                buf += d
+                if b";" in buf:
+                    return buf[: buf.index(b";") + 1]
+        return buf
+
+    def query(self, cmd, timeout=1.0):
+        import termios
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        self.write(cmd)
+        return self.read_reply(timeout).decode("ascii", "replace").strip()
+
+    def close(self):
+        try: os.close(self.fd)
+        except OSError: pass
+
+
+def flrig_find(name=FLRIG_NAME):
+    """Running flrig: {pid, argv, cwd, env (GUI subset), unit, kind} or None.
+    kind 'unit' = a real (non-transient) systemd --user service, restarted with systemctl;
+    kind 'app' = desktop-launched (gnome scope) or a transient systemd-run unit, restarted with
+    systemd-run --user in the graphical session using its old environment."""
+    for d in sorted(os.listdir("/proc"), key=lambda x: (len(x), x)):
+        if not d.isdigit():
+            continue
+        try:
+            if open("/proc/%s/comm" % d).read().strip() != name:
+                continue
+            if os.stat("/proc/" + d).st_uid != os.getuid():
+                continue
+            argv = [a for a in open("/proc/%s/cmdline" % d, "rb").read().decode(errors="replace").split("\0") if a]
+            envl = open("/proc/%s/environ" % d, "rb").read().decode(errors="replace").split("\0")
+            cg = open("/proc/%s/cgroup" % d).read().strip().split("/")[-1]
+            cwd = os.readlink("/proc/%s/cwd" % d)
+        except OSError:
+            continue
+        env = {}
+        for kv in envl:
+            k, _, v = kv.partition("=")
+            if k in GUI_ENV:
+                env[k] = v
+        kind = "app"
+        if cg.endswith(".service"):
+            try:
+                o = subprocess.run(["systemctl", "--user", "show", "-p", "Transient", "--value", cg],
+                                   capture_output=True, text=True, timeout=3).stdout.strip()
+                if o == "no":
+                    kind = "unit"
+            except Exception:
+                pass
+        return {"pid": int(d), "argv": argv, "cwd": cwd, "env": env, "unit": cg, "kind": kind}
+    return None
+
+
+def flrig_describe(fi):
+    if fi is None:
+        return "not running"
+    if fi["kind"] == "unit":
+        return "systemd --user unit %s (pid %d)" % (fi["unit"], fi["pid"])
+    return "desktop app (pid %d, %s)" % (fi["pid"], fi["unit"] or "no unit")
+
+
+def flrig_restart_cmd(fi, now=None):
+    """argv that starts flrig again the way it ran."""
+    if fi["kind"] == "unit":
+        return ["systemctl", "--user", "start", fi["unit"]]
+    cmd = ["systemd-run", "--user", "--collect", "--quiet",
+           "--unit=app-flrig-catreset-%d" % int(now if now is not None else time.time()),
+           "--working-directory=" + (fi["cwd"] or HOME)]
+    for k in GUI_ENV:
+        if k in fi["env"] and k not in ("HOME", "PATH"):
+            cmd.append("--setenv=%s=%s" % (k, fi["env"][k]))
+    return cmd + (fi["argv"] or ["/usr/bin/flrig"])
+
+
+def _pid_alive(pid):
+    try:
+        st = open("/proc/%d/stat" % pid).read()
+        return st.rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def flrig_stop(fi, say):
+    if fi["kind"] == "unit":
+        subprocess.run(["systemctl", "--user", "stop", fi["unit"]], timeout=FLRIG_STOP_S + 5)
+    else:
+        os.kill(fi["pid"], signal.SIGTERM)
+    end = time.monotonic() + FLRIG_STOP_S
+    while _pid_alive(fi["pid"]) and time.monotonic() < end:
+        time.sleep(0.2)
+    if _pid_alive(fi["pid"]):
+        raise CatError("flrig (pid %d) did not exit within %.0f s" % (fi["pid"], FLRIG_STOP_S))
+    say("flrig stopped")
+
+
+def flrig_start(fi, say, rig=None):
+    cmd = flrig_restart_cmd(fi)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise CatError("restarting flrig failed: %s" % (r.stderr.strip() or r.returncode))
+    rig = rig or Rig()
+    end = time.monotonic() + FLRIG_UP_S
+    while time.monotonic() < end:
+        try:
+            p = rig.get_ptt()
+            say("flrig restarted (%s), answers, PTT=%s" % ("systemctl" if fi["kind"] == "unit" else "graphical session", p))
+            return True
+        except Exception:
+            time.sleep(0.5)
+    say("flrig restarted but not answering on XML-RPC yet")
+    return False
+
+
+def ps_on(reply): return reply == "PS1;"
+
+
+def cat_power_cycle(port, say, off_wait=None, boot_wait=None, boot_max=None, sleep=time.sleep):
+    """The CAT sequence on an open CatPort. Returns a summary string; raises CatError."""
+    off_wait = CAT_OFF_WAIT_S if off_wait is None else off_wait
+    boot_wait = CAT_BOOT_WAIT_S if boot_wait is None else boot_wait
+    boot_max = CAT_BOOT_MAX_S if boot_max is None else boot_max
+    r = port.query(b"PS;")
+    was_on = ps_on(r)
+    say("PS; -> %s" % (r or "no reply"))
+    if was_on:
+        port.write(b"PS0;")
+        say("sent PS0; (power off), waiting %.0f s" % off_wait)
+        sleep(off_wait)
+        r = port.query(b"PS;")
+        if r:
+            raise CatError("radio still answers after PS0; (%s): not power-cycled" % r)
+        say("PS; -> no reply (radio off)")
+    else:
+        say("no PS1; reply: radio off or CAT not answering, trying power on")
+    port.write(b";")
+    sleep(0.3)
+    port.write(b"PS1;")
+    say("sent wake ; + PS1; (power on), waiting %.0f s for boot" % boot_wait)
+    sleep(boot_wait)
+    t, r = boot_wait, ""
+    while True:
+        r = port.query(b"PS;")
+        if ps_on(r) or t >= boot_max:
+            break
+        sleep(1.0); t += 2.0
+    if not ps_on(r):
+        if not was_on:
+            raise CatError("no CAT reply before or after power-on: check the radio and the cable")
+        raise CatError("radio did not come back (PS; -> %s)" % (r or "no reply"))
+    say("PS; -> PS1; (on)")
+    tx = port.query(b"TX;")
+    say("TX; -> %s" % (tx or "no reply"))
+    if tx != "TX0;":
+        raise CatError("radio on but TX; answered %s (expected TX0;)" % (tx or "nothing"))
+    return "radio power-cycled, PS1 TX0"
+
+
+def cat_reset(dry_run, say, rig=None, keyed=lambda: os.path.exists(MARK)):
+    """Full CAT reset (or a dry run). say(text) gets each step. Returns (ok, summary).
+    flrig is always started again if this stopped it, also when a step fails."""
+    import fcntl
+    os.makedirs(os.path.dirname(CAT_LOCK), exist_ok=True)
+    lk = open(CAT_LOCK, "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lk.close()
+        return False, "another CAT reset is running"
+    st = {"fi": None, "stopped": False, "port": None}
+    try:
+        ok, summary = _cat_reset(dry_run, say, rig, keyed, st)
+    except CatError as e:
+        ok, summary = False, str(e)
+    except Exception as e:
+        log.exception("cat reset")
+        ok, summary = False, "error: %s" % e
+    finally:
+        if st["port"]:
+            st["port"].close()
+        lk.close()
+    if st["stopped"]:
+        try:
+            if not flrig_start(st["fi"], say, rig):
+                summary += "; flrig restarted but not answering yet"
+        except Exception as e:
+            say("WARNING: flrig restart failed: %s" % e)
+            summary += "; flrig NOT restarted (%s): start it by hand" % e
+            ok = False
+    return ok, summary
+
+
+def cat_reset_unit_cmd(dry_run, now=None):
+    """Run --cat-reset in its own transient systemd --user unit (same env files as the gate's
+    unit), so stopping the gate or dropping ssh mid-reset can't leave flrig stopped."""
+    home_cfg = os.path.join(HOME, ".config")
+    cmd = ["systemd-run", "--user", "--quiet", "--collect", "--wait", "--pipe",
+           "--unit=ft710-catreset-%d" % int(now if now is not None else time.time()),
+           "-p", "EnvironmentFile=-" + os.path.join(home_cfg, "radio-bridge", "bridge.env"),
+           "-p", "EnvironmentFile=-" + os.path.join(home_cfg, "ft710-txgate", "txgate.env"),
+           sys.executable, "-u", os.path.abspath(__file__), "--cat-reset"]
+    return cmd + (["--dry-run"] if dry_run else [])
+
+
+def cat_reset_via_unit(dry_run, say, keyed=None, timeout=150):
+    """Gate side: run the reset in a transient unit and relay its step lines. (ok, summary)."""
+    if keyed and keyed():
+        return False, "refused: PTT is active"
+    try:
+        p = subprocess.Popen(cat_reset_unit_cmd(dry_run), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, text=True)
+    except OSError as e:
+        return False, "cannot start the CAT reset unit: %s" % e
+    killer = threading.Timer(timeout, p.kill); killer.start()
+    result = None
+    try:
+        for ln in p.stdout:
+            ln = ln.rstrip("\n")
+            if ln.startswith("step: "):
+                say(ln[6:])
+            elif ln.startswith("result="):
+                result = ln[7:]
+            elif ln.strip():
+                say(ln.strip())
+        p.wait()
+    finally:
+        killer.cancel()
+    if result is None:
+        return False, "CAT reset unit ended without a result (exit %s)" % p.returncode
+    ok, _, summary = result.partition(" ")
+    return ok == "ok", summary
+
+
+def _cat_reset(dry_run, say, rig, keyed, st):
+    if keyed():
+        return False, "refused: the TX gate has the rig keyed (release PTT)"
+    fi = st["fi"] = flrig_find()
+    say("flrig: " + flrig_describe(fi))
+    try:
+        say("flrig PTT=%s" % (rig or Rig()).get_ptt())
+    except Exception:
+        if fi:
+            say("flrig PTT: no answer")
+    path, baud, stop, src = cat_settings(read_flrig_prefs())
+    say("CAT port %s (%s), %d 8N%d" % (path, src, baud, stop))
+    if not os.path.exists(path):
+        return False, "CAT port %s does not exist (radio USB unplugged?)" % path
+    holders = port_holders(path)
+    others = [h for h in holders if not fi or h != fi["pid"]]
+    if others:
+        return False, "CAT port busy: open by pid %s (not flrig)" % ",".join(map(str, others))
+    if dry_run:
+        if holders:
+            say("dry run: flrig owns the port; a real reset stops flrig, power-cycles, restarts flrig")
+            return True, "dry run ok: port found, flrig %s, would restart it via %s" % (
+                flrig_describe(fi), " ".join(flrig_restart_cmd(fi)[:3]) if fi else "-")
+        port = st["port"] = CatPort(path, baud, stop)
+        r = port.query(b"PS;")
+        say("PS; -> %s" % (r or "no reply"))
+        if ps_on(r):
+            say("TX; -> %s" % (port.query(b"TX;") or "no reply"))
+        return ps_on(r), "dry run: " + ("radio on (PS1)" if ps_on(r) else "no PS1 reply")
+    if fi:
+        flrig_stop(fi, say); st["stopped"] = True
+    end = time.monotonic() + 5
+    while port_holders(path) and time.monotonic() < end:
+        time.sleep(0.2)
+    if port_holders(path):
+        return False, "CAT port still busy after stopping flrig"
+    port = st["port"] = CatPort(path, baud, stop)
+    return True, cat_power_cycle(port, say)
+
+
 class Gate:
     IDLE, KEYED = "idle", "keyed"
     HOLD, PLAY, GAP, DRAIN = "hold", "play", "gap", "drain"
@@ -266,6 +674,7 @@ class Gate:
         self.rig_ptt = "?"
         self.last_reason = ""
         self.buf = bytearray()
+        self.cat_busy = False                  # CAT reset running: never key
         self.stats = {"overs": 0, "pkts": 0, "underruns": 0}
 
     # ---- called from the network thread ----
@@ -323,6 +732,7 @@ class Gate:
     def refuse_reason(self):
         f = self.flags
         if SAFE: return "safe mode (TG_SAFE): keying disabled"
+        if self.cat_busy: return "CAT reset in progress"
         if not f["tx_enabled"]: return "TX keying is off (tx_enabled)"
         if f["bridge"]: return "radio-bridge is running; it owns PTT"
         if f["bridge_keyed"]: return "radio-bridge has the rig keyed"
@@ -375,6 +785,27 @@ class Gate:
             self.event("unkeyed: " + why)
             if why != "released" and self.latched is None:
                 self.latched = why + ": release PTT to key again"
+
+    def start_cat_reset(self, dry, runner=None):
+        """From the control link: refuse while keyed / PTT held, else run cat_reset in a thread.
+        Progress goes out as EVENT "catreset: ..." lines, the end as EVENT "catreset-done ok|fail ..."."""
+        with self.lock:
+            if self.cat_busy:
+                return "refused: a CAT reset is already running"
+            if self.state == self.KEYED or self.ptt_req:
+                return "refused: PTT is active (release PTT first)"
+            self.cat_busy = True
+        def run():
+            try:
+                ok, summary = (runner or cat_reset_via_unit)(dry, lambda t: self.event("catreset: " + t),
+                                                    keyed=lambda: self.state == self.KEYED or self.ptt_req)
+            except Exception as e:
+                ok, summary = False, "error: %s" % e
+            finally:
+                self.cat_busy = False
+            self.event("catreset-done %s %s" % ("ok" if ok else "fail", summary))
+        threading.Thread(target=run, daemon=True).start()
+        return "started (%s)" % ("dry run" if dry else "power-cycle")
 
     def emergency_all(self, why):
         """Signal handler / shutdown: unkey now, whatever the state."""
@@ -559,6 +990,9 @@ class Net(threading.Thread):
             self.gate.ptt(c["id"], parts[1] == "1")
         elif cmd == "BYE":
             self._drop(s, "bye")
+        elif cmd == "CATRESET":
+            self.gate.heartbeat(c["id"])
+            self._send(s, "EVENT catreset: " + self.gate.start_cat_reset(len(parts) > 1 and parts[1] == "DRY"))
         else:
             self.gate.heartbeat(c["id"])
 
@@ -687,9 +1121,18 @@ def unkey_if_marked():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--unkey-if-marked", action="store_true", help="unkey via flrig if our keyed marker exists, then exit")
+    ap.add_argument("--cat-reset", action="store_true", help="power-cycle the FT-710 over CAT (stops and restarts flrig), then exit")
+    ap.add_argument("--dry-run", action="store_true", help="with --cat-reset: only find the port and read PS (nothing stopped or sent)")
+    ap.add_argument("--in-unit", action="store_true", help="with --cat-reset: run it in its own transient systemd --user unit (survives ssh drops)")
     a = ap.parse_args()
     if a.unkey_if_marked:
         sys.exit(unkey_if_marked())
+    if a.cat_reset:
+        logging.getLogger().setLevel(logging.WARNING)
+        say = lambda t: print("step: " + t, flush=True)
+        ok, summary = cat_reset_via_unit(a.dry_run, say) if a.in_unit else cat_reset(a.dry_run, say)
+        print("result=%s %s" % ("ok" if ok else "fail", summary), flush=True)
+        sys.exit(0 if ok else 1)
     rig = Rig()
     if os.path.exists(MARK):
         log.warning("keyed marker left from a previous run: unkeying")

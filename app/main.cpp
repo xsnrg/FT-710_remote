@@ -352,14 +352,10 @@ public:
         updateTitle();
         auto *v = new QVBoxLayout(this);
 
-        // Connection row
+        // Status line (Start/Stop in the "RX network" row connects and disconnects)
         auto *row = new QHBoxLayout;
-        connectBtn = new QPushButton("Connect");
-        connectBtn->setToolTip("Starts the network receive audio and the link to the TX gate on the rig host.");
-        disconnectBtn = new QPushButton("Disconnect");
-        disconnectBtn->setToolTip("Releases PTT and stops the network receive audio and the TX gate (it unkeys first).");
         statusLbl = new QLabel;
-        row->addWidget(connectBtn); row->addWidget(disconnectBtn); row->addWidget(statusLbl, 1);
+        row->addWidget(statusLbl, 1);
         v->addLayout(row);
 
         // PTT
@@ -413,7 +409,8 @@ public:
         netMuteBtn = new QToolButton; netMuteBtn->setCheckable(true); netMuteBtn->setChecked(naCfg.listenMute);
         netMuteBtn->setToolTip("Listen to the network stream on this computer's speakers.");
         netStartBtn = new QPushButton("Start");
-        netStartBtn->setToolTip("Start/stop the network audio stream (also started by Connect and stopped by Disconnect).");
+        netStartBtn->setToolTip("Start: the network receive audio and the link to the TX gate on the rig host (PTT).\n"
+                                "Stop: releases PTT and stops the network receive audio and the TX gate (it unkeys first).");
         nr->addWidget(netName); nr->addWidget(netLevel); nr->addWidget(gainName); nr->addWidget(netGain, 1); nr->addWidget(netGainLbl); nr->addWidget(netVol, 1); nr->addWidget(netVolLbl); nr->addWidget(netMuteBtn); nr->addWidget(netStartBtn);
         v->addWidget(netRow);
         // TX mic: level of what PTT would send to the TX gate.
@@ -432,6 +429,7 @@ public:
         tx = new TxLink(this);
         tx->changed = [this] { updateTxUi(); };
         tx->logLine = [](const QString &m) { QTextStream(stderr) << "txgate: " << m << Qt::endl; };
+        tx->catEvent = [this](const QString &e) { catGateEvent(e); };
         tx->pttLost = [this](const QString &why) {
             if (!talking || !talkNet) return;
             talking = false; talkNet = false; tx->setPtt(false);
@@ -452,7 +450,7 @@ public:
         netGainApply.setSingleShot(true); netGainApply.setInterval(80);   // live, coalesced while dragging
         connect(&netGainApply, &QTimer::timeout, this, [this] { na->setRxGain(std::pow(10.0, netGain->value() / 200.0)); });
         connect(&netVolApply, &QTimer::timeout, this, [this] { na->setListen(netVol->value(), netMuteBtn->isChecked()); });
-        connect(netStartBtn, &QPushButton::clicked, this, [this] { if (na->active()) na->stop(false); else na->start(); });
+        connect(netStartBtn, &QPushButton::clicked, this, [this] { if (na->active() || tx->active()) doDisconnect(); else doConnect(); });
         na->changed = [this] { updateNetUi(); };
         na->logLine = [](const QString &m) { QTextStream(stderr) << "netaudio: " << m << Qt::endl; };
         txApply.setSingleShot(true); txApply.setInterval(150);   // coalesce slider drags (one ssh per settle)
@@ -585,8 +583,11 @@ public:
         auto *helpBtn = new QPushButton("Help / About");
         settingsBtn = new QPushButton("Settings…");
         settingsBtn->setToolTip("Rig host, flrig, network audio / TX gate and band-scope settings.");
+        catBtn = new QPushButton("CAT reset");
+        catBtn->setToolTip("Power-cycle the FT-710 over its CAT serial port on the rig host, bypassing flrig (for a stuck rig, "
+                           "as long as CAT still answers). flrig is stopped for it and started again. Refused while PTT is held.");
         logBtn = new QToolButton; logBtn->setText("Show log"); logBtn->setCheckable(true);
-        row2->addWidget(txBtn, 1); row2->addWidget(logBtn); row2->addWidget(settingsBtn); row2->addWidget(helpBtn);
+        row2->addWidget(txBtn, 1); row2->addWidget(logBtn); row2->addWidget(settingsBtn); row2->addWidget(catBtn); row2->addWidget(helpBtn);
         v->addLayout(row2);
 
         log = new QPlainTextEdit; log->setReadOnly(true); log->setVisible(false);
@@ -597,8 +598,13 @@ public:
         for (auto *b : findChildren<QAbstractButton *>()) b->setFocusPolicy(Qt::NoFocus);
         log->setFocusPolicy(Qt::NoFocus);
 
-        connect(connectBtn, &QPushButton::clicked, this, [this] { doConnect(); });
-        connect(disconnectBtn, &QPushButton::clicked, this, [this] { doDisconnect(); });
+        connect(catBtn, &QPushButton::clicked, this, [this] { doCatReset(false, true); });
+        catGuard.setSingleShot(true);
+        connect(&catGuard, &QTimer::timeout, this, [this] {
+            if (resetProc) { resetProc->disconnect(); resetProc->kill(); resetProc->deleteLater(); resetProc = nullptr; }
+            catFinish(false, "no result in time" + QString(catViaLink ? " from the TX gate (the reset runs on in its own unit on the rig host; "
+                                                                        "check the radio and flrig)" : ""));
+        });
         connect(ptt, &QPushButton::pressed, this, [this] { pressPtt(); });
         connect(ptt, &QPushButton::released, this, [this] { stopTalk(); });
         connect(txBtn, &QPushButton::clicked, this, [this] { toggleTx(); });
@@ -679,7 +685,8 @@ private:
     }
 
 private:
-    QPushButton *connectBtn, *disconnectBtn, *ptt, *txBtn;
+    QPushButton *ptt, *txBtn, *catBtn;
+    QProcess *resetProc = nullptr; QTimer catGuard; bool catBusy = false, catViaLink = false, catDry = false; QStringList catLog; QByteArray catBuf;
     // --- band scope ---
     QCheckBox *scopeChk, *scopeTuneChk, *scopeSnapChk; QWidget *scopeTuneOpts; QComboBox *scopeSnapStep; QSpinBox *scopeSsbOff;
     ScopeWidget *scope;
@@ -883,7 +890,7 @@ private:
         else { micDev->setText(nodeNames.label(naCfg.micSource)); micDev->setToolTip("PipeWire source: " + naCfg.micSource); }
         if (tx->active()) micUi.start(); else { micUi.stop(); updateMicUi(); }
         if (tx->active()) colored(txgLbl, tx->statusText(), tx->gateKeyed() ? "#c00" : tx->ready() ? "green" : "#c60");
-        else colored(txgLbl, "not connected (Connect starts it)" + (gateSvc.isEmpty() ? QString() : " · service " + gateSvc), "gray");
+        else colored(txgLbl, "not connected (Start starts it)" + (gateSvc.isEmpty() ? QString() : " · service " + gateSvc), "gray");
         if (tx->ready()) showPtt(tx->rigPtt());
         if (talking && talkNet) {
             ptt->setText(tx->gateKeyed() ? "TALKING" : "TALKING?\n(" + (tx->lastEvent().isEmpty() ? QString("gate not keyed yet") : tx->lastEvent()) + ")");
@@ -898,7 +905,7 @@ private:
     }
     void updateNetUi() {
         const bool act = na->active();
-        netStartBtn->setText(act ? "Stop" : "Start");
+        netStartBtn->setText(act || tx->active() ? "Stop" : "Start");
         QString st = na->statusText();
         if (act && naCfg.listenMute) st += " · Listen is off (not playing on this computer's speakers)";
         colored(netLbl, st, !act ? "gray" : na->linkUp() ? "green" : "#c60");
@@ -915,7 +922,8 @@ private:
     // Press: arm the debounce timer; a release within PTT_MIN_HOLD_MS cancels without keying.
     void pressPtt() {
         if (talking || holdTimer.isActive()) return;
-        if (!tx->ready()) { ptt->setDown(false); note("TX link not ready — " + (tx->active() ? tx->statusText() : QString("Connect first"))); return; }
+        if (catBusy) { ptt->setDown(false); note("Not keying — a CAT reset is running"); return; }
+        if (!tx->ready()) { ptt->setDown(false); note("TX link not ready — " + (tx->active() ? tx->statusText() : QString("press Start first"))); return; }
         if (txState != "on") { ptt->setDown(false); note("TX keying is disabled (Enable TX keying first)"); return; }
         if (!tx->micUp()) { ptt->setDown(false); note("Not keying — " + tx->micProblem()); return; }
         ptt->setStyleSheet("background:#e90; color:black;");
@@ -954,10 +962,10 @@ private:
     }
 
 public:
-    // Connect: start the network receive audio and the TX gate link (PTT and the mic go to the gate).
+    // Start (was Connect): start the network receive audio and the TX gate link (PTT and the mic go to the gate).
     void doConnect() {
         if (!cfg.configured()) {
-            QMessageBox::information(this, "Connect", "Set the rig host in Settings first.");
+            QMessageBox::information(this, "Start", "Set the rig host in Settings first.");
             editSettings(); return;
         }
         if (!na->active()) na->start();
@@ -1004,8 +1012,76 @@ private:
     void doDisconnect() {
         stopTalk(true);
         if (na->active()) na->stop(true);
-        if (tx->active()) { tx->stop(true, false); note("Disconnected: TX gate stopping"); }
-        updateTxUi();
+        if (tx->active()) { tx->stop(true, false); note("Stopped: TX gate stopping"); }
+        updateTxUi(); updateNetUi();
+    }
+
+    // CAT reset: power-cycle the FT-710 over CAT on the rig host (flrig is stopped and restarted there).
+    // Through the TX gate's control link when it is ready, else over ssh with the gate's own code
+    // (ft710_txgate.py --cat-reset --in-unit), which also works when the gate can't start (stuck PTT).
+    static constexpr const char *CAT_SSH = R"SH(
+GATE="$HOME/ft710-txgate/ft710_txgate.py"
+[ -r "$GATE" ] || { echo "result=fail TX gate code not found at ~/ft710-txgate/ft710_txgate.py (see README)"; exit 0; }
+exec python3 -u "$GATE" --cat-reset --in-unit $DRY
+)SH";
+public:
+    void doCatReset(bool dry, bool ask) {
+        if (catBusy) return;
+        if (!cfg.configured()) { QMessageBox::information(this, "CAT reset", "Set the rig host in Settings first."); return; }
+        if (talking || tx->gateKeyed()) { note("CAT reset refused: PTT is active (release PTT first)"); return; }
+        if (ask && QMessageBox::question(this, "CAT reset", "Power-cycle the FT-710 over CAT? flrig will be restarted.",
+                                         QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+        if (talking || tx->gateKeyed()) { note("CAT reset refused: PTT is active (release PTT first)"); return; }
+        catBusy = true; catDry = dry; catBtn->setEnabled(false); catBtn->setText("CAT reset…");
+        catLog.clear();
+        catViaLink = tx->sendCatReset(dry);
+        catSay(QString(dry ? "dry run" : "power-cycle") + " requested " + (catViaLink ? "via the TX gate link" : "over ssh (TX gate link not up)"));
+        catGuard.start(dry ? 30000 : 120000);
+        if (catViaLink) return;
+        resetProc = new QProcess(this); catBuf.clear();
+        connect(resetProc, &QProcess::readyReadStandardOutput, this, [this] {
+            catBuf += resetProc->readAllStandardOutput();
+            int nl;
+            while ((nl = catBuf.indexOf('\n')) >= 0) {
+                const QString l = QString::fromUtf8(catBuf.left(nl)).trimmed(); catBuf.remove(0, nl + 1);
+                if (l.startsWith("step: ")) catSay(l.mid(6));
+                else if (l.startsWith("result=")) { const QString r = l.mid(7); catFinish(r.startsWith("ok"), r.mid(r.indexOf(' ') + 1)); }
+                else if (!l.isEmpty()) catSay(l);
+            }
+        });
+        connect(resetProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus es) {
+            QProcess *p = resetProc; resetProc = nullptr; if (p) p->deleteLater();
+            if (catBusy) catFinish(false, es != QProcess::NormalExit || code == 255 ? cfg.rigName() + " unreachable (ssh)"
+                                                                               : QString("ended without a result (exit %1)").arg(code));
+        });
+        resetProc->start("ssh", sshArgs("bash -s"));
+        resetProc->write((QString("DRY=%1\n").arg(dry ? "--dry-run" : "") + CAT_SSH).toUtf8()); resetProc->closeWriteChannel();
+    }
+private:
+    void catSay(const QString &t) {
+        const QString line = QDateTime::currentDateTime().toString("HH:mm:ss") + " " + t;
+        catLog << line; while (catLog.size() > 60) catLog.removeFirst();
+        QTextStream(stderr) << "catreset: " << t << Qt::endl;
+        if (catBusy) note("CAT reset: " + t);
+        if (log->isVisible()) log->appendPlainText("CAT reset: " + line);
+    }
+    void catGateEvent(const QString &e) {
+        if (!catBusy) { catSay("(gate) " + e); return; }
+        if (e.startsWith("catreset-done ")) {
+            const QString r = e.mid(14); catFinish(r.startsWith("ok"), r.mid(r.indexOf(' ') + 1)); return;
+        }
+        const QString t = e.startsWith("catreset: ") ? e.mid(10) : e;
+        if (t.startsWith("refused")) { catFinish(false, t); return; }
+        catSay(t);
+    }
+    void catFinish(bool ok, const QString &summary) {
+        if (!catBusy) return;
+        catGuard.stop();
+        catSay(QString(ok ? "OK" : "FAILED") + ": " + summary);
+        catBusy = false; catBtn->setEnabled(true); catBtn->setText("CAT reset");
+        note(QString(catDry ? "CAT reset dry run " : "CAT reset ") + (ok ? "OK: " : "FAILED: ") + summary);
+        fastPollSince.start(); adjustPollRate();
+        if (!ok && !catDry) QMessageBox::warning(this, "CAT reset", "CAT reset failed:\n" + summary);
     }
 
     void toggleTx() {
@@ -1189,13 +1265,15 @@ private:
             QFile f(path);
             md = f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) + "\n\n---\n" : path + " not found.\n\n---\n";
         }
-        md += "**FT-710 Remote 1.0**: Connect starts the network receive audio (ROC or RTP from the rig host; the input device "
+        md += "**FT-710 Remote 1.0**: Start (in the RX network row) starts the network receive audio (ROC or RTP from the rig host; the input device "
               "\"FT-710 RX (network)\" for WSJT-X/fldigi, and Listen plays it here) and the link to the ft710-txgate service on "
               "the rig host. Hold PTT or Space to talk: this computer's microphone goes straight to the TX gate, which keys the "
               "radio through flrig only while you hold PTT (key, ~70 ms, then audio; 0.7 s hang after release; 120 s timeout) "
               "and unkeys by itself if the link, heartbeat or audio stops. Releasing, switching windows or closing the app always "
               "stops talking. \"Enable TX keying\" arms the gate (tx_enabled on the rig host); \"TX level\" is applied by the gate. "
-              "Disconnect (or closing the app) stops the stream and the gate. "
+              "Stop (or closing the app) stops the stream and the gate. "
+              "**CAT reset** power-cycles the FT-710 over its CAT port on the rig host, bypassing flrig (flrig is stopped "
+              "and started again; refused while PTT is held). "
               "**Band scope**: spectrum + waterfall from the FT-710 itself (MENU SCU-LAN10 = ON; streamed by "
               "the ft710-scope service on the rig host). The shaded band is the approximate passband, the red line "
               "the VFO. With \"Click to tune\" on, a single click sets VFO-A there via flrig (only while receiving). "
@@ -1261,13 +1339,14 @@ private:
         parseTx(kv["txgain"]);
         vfoLbl->setText(okv && hz > 0 ? QString::number(hz / 1e6, 'f', 6) + " MHz" : "?");
 
-        if (log->isVisible() && li >= 0) log->setPlainText(logText.trimmed());
+        if (log->isVisible() && li >= 0)
+            log->setPlainText((catLog.isEmpty() ? QString() : "--- CAT reset (this app) ---\n" + catLog.join('\n') + "\n--- TX gate log ---\n") + logText.trimmed());
         updateUi();
     }
     void updateUi() {
         if (!(noteAge.isValid() && noteAge.elapsed() < 8000))
-            statusLbl->setText(tx->active() ? "TX gate: " + tx->statusText() : "Not connected — Connect starts the network audio and the TX gate");
-        disconnectBtn->setEnabled(tx->active() || na->active());
+            statusLbl->setText(tx->active() ? "TX gate: " + tx->statusText() : "Not connected — Start (RX network row) starts the network audio and the TX gate");
+        netStartBtn->setText(na->active() || tx->active() ? "Stop" : "Start");
         ptt->setEnabled(tx->ready() || talking);
         txBtn->setEnabled(txState == "on" || txState == "off");
         txBtn->setText(txState == "on" ? "Disable TX keying (go receive-only)"
