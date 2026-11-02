@@ -27,7 +27,8 @@ It has two halves:
   internal FTDI FT4222 USB-to-SPI bridge, which appears on USB only when
   **MENU → SCU-LAN10 = ON**. The client shows spectrum + waterfall, with span and
   reference-level / auto-contrast controls, and **click-to-tune** (sets VFO-A via flrig;
-  frequency only).
+  frequency only). **Snap to kHz** (on by default) rounds a click to the nearest whole kHz
+  (3.788678 → 3.789000 MHz); off, it rounds to 10/100/500 Hz depending on the span.
 * **Network audio (optional, receive only)** – instead of hearing the radio only through
   Mumble, the rig host streams the radio's receive audio straight to the desktop with
   PipeWire (ROC with FEC, or RTP; optional Opus compression for VPN use). It appears as the
@@ -200,6 +201,17 @@ How it works:
 Audio → Input; fldigi: Configure → Sound Card → PulseAudio/PortAudio capture). It is a
 normal PipeWire/Pulse source (`ft710_rx_net`), mono 48 kHz. Transmit audio is unchanged.
 
+**RX gain** (slider in the RX network row, −6 to +20 dB = 0.5×–10×, default +9.5 dB = 3× like
+the Mumble bridge's RX gain; saved as `netaudio/rxGain`). It is applied on the desktop, in all
+modes, to what WSJT-X/fldigi, the level meter and the listen monitor get, and changes live
+(no restart, no dropout). A lookahead limiter (3 ms lookahead, 150 ms release) holds peaks at
+−1 dBFS, so no slider position clips; double-click the value to reset it. The limiter is a
+small LADSPA plugin (`app/netaudio/ft710_rxlimit.c`) compiled into the app and run in a
+PipeWire filter-chain: the stream arrives as "FT-710 RX (network, before RX gain)"
+(`ft710_rx_net_raw`) and the chain outputs "FT-710 RX (network)". Tests:
+`app/tests/test_rxlimit.sh` (0 dBFS sine/square/noise/clicks at up to 20×) and `ctest` in the
+build directory.
+
 Requirements:
 * PipeWire ≥ 1.0 on both computers (`pipewire -c`, `pw-record`, `pw-loopback`, `pactl`).
 * **ROC**: `pipewire-module-roc` (roc-toolkit ≥ 0.4) on **both** computers
@@ -254,7 +266,9 @@ the templates compiled into the app.
 Command line (handy for testing; `--na-*` overrides are not saved):
 
 ```sh
-ft710-remote --netaudio start [--na-mode roc|rtp] [--na-compression none|opus] [--na-bitrate 32] [--na-port N] [--na-latency MS]
+ft710-remote --netaudio start [--na-mode roc|rtp] [--na-compression none|opus] [--na-bitrate 32] [--na-port N] [--na-latency MS] [--na-rx-gain 3|9.5dB]
+ft710-remote --netaudio status --na-rx-gain 6dB   # set the gain on the running receiver (not saved)
+ft710-remote --print-receiver-conf                # the PipeWire receiver config the app writes
 ft710-remote --netaudio watch 30    # monitor a running stream: level, unit states, recoveries
 ft710-remote --netaudio stop
 ```

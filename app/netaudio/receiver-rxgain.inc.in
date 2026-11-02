@@ -1,0 +1,37 @@
+    # RX gain + lookahead limiter (ft710_rxlimit LADSPA plugin, shipped inside ft710-remote): the
+    # network source above ("before RX gain") -> gain -> brick-wall limiter at @CEILING@ dBFS ->
+    # "FT-710 RX (network)". No gain setting can clip what decoders or the listen monitor get.
+    # The app changes the gain live: pw-cli set-param @NODE@_gain Props '{ params = [ "rx:Gain" x ] }'
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "FT-710 RX (network)"
+            media.name = "FT-710 RX (network)"
+            filter.graph = {
+                nodes = [
+                    { type = ladspa name = rx plugin = "@PLUGIN@" label = ft710_rxlimit
+                      control = { "Gain" = @GAIN@ "Ceiling" = @CEILING@ "Release" = 150.0 } }
+                ]
+            }
+            audio.channels = 1
+            audio.position = [ MONO ]
+            capture.props = {
+                node.name = "@NODE@_gain"
+                node.description = "FT-710 RX (network) RX gain"
+                media.class = "Stream/Input/Audio"
+                target.object = "@RAW_NODE@"
+                node.autoconnect = true
+                node.dont-fallback = true
+                node.passive = false
+                node.always-process = true
+                stream.dont-remix = true
+            }
+            playback.props = {
+                node.name = "@NODE@"
+                node.description = "@DESC@"
+                media.class = "Audio/Source"
+                node.always-process = true
+                node.pause-on-idle = false
+                session.suspend-timeout-seconds = 0
+            }
+        }
+    }

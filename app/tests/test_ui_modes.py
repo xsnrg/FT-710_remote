@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Regression test for the RX controls per audio mode (offscreen, throwaway settings dir).
 
+Also: the network RX gain slider (shown only in network mode, default +9.5 dB = 3x, saved value
+shown, the stored 3.0 not rewritten just by starting) and the band scope's "Snap to kHz" checkbox
+(default on, saved setting honoured, greyed out when click-to-tune is off).
+
 Direct-TX mode must not show Mumble's (always disabled there) RX volume slider, must keep the
 network listen slider and Listen toggle usable, and switching to direct TX must turn Listen on
 (nothing else plays the radio without Mumble); switching back to Mumble TX turns it off.
@@ -59,6 +63,31 @@ check("switch to direct TX keeps the listen volume", "listenVolume=80" in saved)
 lines, saved = run(NA % ("true", "false"), switch="0")
 check("switch back to Mumble TX turns Listen off", line(lines, "toolbutton:", "Listen: off") != "" and "listenMute=true" in saved,
       line(lines, "toolbutton:", "Listen:"))
+
+# RX gain slider (value is in 0.1 dB)
+lines, _ = run("")
+check("Mumble mode: RX gain slider hidden", "[hidden]" in line(lines, "slider:", "RX gain"), line(lines, "slider:", "RX gain"))
+lines, saved = run(NA % ("false", "true"))
+l = line(lines, "slider:", "RX gain")
+check("network mode: RX gain slider shown, enabled, default +9.5 dB", "value=95" in l and "[hidden]" not in l and "[disabled]" not in l, l)
+check("network mode: RX gain label shows +9.5 dB", line(lines, "label:", "+9.5 dB") != "")
+check("starting doesn't rewrite the RX gain", "rxGain" not in saved)
+lines, _ = run(NA % ("false", "true") + "rxGain=10\n")
+check("saved RX gain 10x shows +20.0 dB (slider max)", "value=200" in line(lines, "slider:", "RX gain") and line(lines, "label:", "+20.0 dB") != "",
+      line(lines, "slider:", "RX gain"))
+lines, _ = run(NA % ("false", "true") + "rxGain=0.5\n")
+check("saved RX gain 0.5x shows -6.0 dB (slider min)", "value=-60" in line(lines, "slider:", "RX gain"), line(lines, "slider:", "RX gain"))
+lines, _ = run(NA % ("false", "true") + "rxGain=99\n")
+check("out-of-range RX gain is clamped to 10x", "value=200" in line(lines, "slider:", "RX gain"), line(lines, "slider:", "RX gain"))
+
+# Snap to kHz (scope shown by default; offscreen it can't connect, but the controls exist)
+lines, _ = run("")
+l = line(lines, "checkbox:", "Snap to kHz")
+check("Snap to kHz: present and on by default", "[checked]" in l and "[disabled]" not in l, l)
+lines, _ = run("[General]\nscopeSnapKHz=false\n")
+check("Snap to kHz: saved off is honoured", (l := line(lines, "checkbox:", "Snap to kHz")) != "" and "[checked]" not in l, l)
+lines, _ = run("[General]\nscopeClickTune=false\n")
+check("Snap to kHz: disabled when click-to-tune is off", "[disabled]" in line(lines, "checkbox:", "Snap to kHz"), line(lines, "checkbox:", "Snap to kHz"))
 
 bad = [n for n, ok in RESULTS if not ok]
 print("\n%d/%d passed" % (len(RESULTS) - len(bad), len(RESULTS)) + ("; FAILED: " + ", ".join(bad) if bad else ""))

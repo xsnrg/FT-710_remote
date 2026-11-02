@@ -4,8 +4,11 @@
 //
 //   rig host:  ft710-netaudio-send  (pipewire roc-sink / rtp-sink, or GStreamer opusenc for Opus)
 //              reads the radio's USB capture node (shared, read-only) and sends it to this computer.
-//   here:      ft710-netaudio-recv  (pipewire roc-source / rtp-source) creates the capture device
-//              "FT-710 RX (network)" (node ft710_rx_net) for WSJT-X, fldigi, ...
+//   here:      ft710-netaudio-recv  (pipewire roc-source / rtp-source) receives it as "FT-710 RX
+//              (network, before RX gain)" (ft710_rx_net_raw); a filter-chain with the bundled
+//              ft710_rxlimit LADSPA plugin (RX gain + lookahead limiter at -1 dBFS, so no gain clips)
+//              turns that into the capture device "FT-710 RX (network)" (node ft710_rx_net) for
+//              WSJT-X, fldigi, the level meter and the listen monitor. The gain changes live (pw-cli).
 //
 // Both run as systemd --user units (transient via systemd-run, or the optional installed unit files
 // from server/netaudio and app/netaudio). Their configs are generated from the templates in those
@@ -26,6 +29,16 @@ struct NetAudioCfg {
     QString destAddr;             // address the rig host sends to; "" = this computer as seen by ssh
     bool keepOnExit = false;      // leave the stream running when the app quits
     int listenVol = 100;          // local monitor (speakers) of the network stream
+    double rxGain = 3.0;          // RX gain on this computer, linear (3x = +9.5 dB, same as radio-bridge's Mumble gain)
+    static constexpr double RX_GAIN_MIN = 0.5, RX_GAIN_MAX = 10.0, RX_CEILING_DB = -1.0;
+    static double gainDb(double g) { return 20.0 * std::log10(g); }
+    static double clampGain(double g) { return std::isfinite(g) ? qBound(RX_GAIN_MIN, g, RX_GAIN_MAX) : 3.0; }
+    // "3", "3.0", "9.5dB" / "+9.5 dB" -> linear gain (NaN if unparsable)
+    static double parseGain(QString t) {
+        t = t.trimmed().toLower(); bool db = t.endsWith("db"); if (db) t.chop(2);
+        bool ok = false; const double v = t.trimmed().toDouble(&ok);
+        return !ok ? std::nan("") : db ? std::pow(10.0, v / 20.0) : v;
+    }
     bool listenMute = true;       // muted by default: Mumble usually plays the RX audio already
     // TX without Mumble (network modes): mic -> RTP -> ft710-txgate on the rig host, PTT over its TCP control link
     bool txGate = true;           // network mode: PTT/TX through the TX gate (false = Mumble + radio-bridge as before)
@@ -43,7 +56,7 @@ struct NetAudioCfg {
         QString s = modeName() + " · " + (effCompression() ? QString("Opus %1 kbit/s").arg(opusKbps) : QString("L16"));
         if (mode == 1) s += " · FEC " + fec;
         if (mode == 2) s += QString(" · %1 ms packets").arg(packetMs);
-        return s + QString(" · %1 ms buffer").arg(latencyMs);
+        return s + QString(" · %1 ms buffer · RX gain %2%3 dB").arg(latencyMs).arg(gainDb(rxGain) >= 0 ? "+" : "").arg(gainDb(rxGain), 0, 'f', 1);
     }
     void load() {
         QSettings st; NetAudioCfg d;
@@ -59,6 +72,7 @@ struct NetAudioCfg {
         keepOnExit = st.value("netaudio/keepOnExit", d.keepOnExit).toBool();
         listenVol = qBound(0, st.value("netaudio/listenVolume", d.listenVol).toInt(), 150);
         listenMute = st.value("netaudio/listenMute", d.listenMute).toBool();
+        rxGain = clampGain(st.value("netaudio/rxGain", d.rxGain).toDouble());
         txGate = st.value("netaudio/txGate", d.txGate).toBool();
         micSource = st.value("netaudio/micSource").toString().trimmed();
         txPort = st.value("netaudio/txPort", d.txPort).toInt();
@@ -73,6 +87,7 @@ struct NetAudioCfg {
         st.setValue("netaudio/fec", fec); st.setValue("netaudio/sourceNode", sourceNode);
         st.setValue("netaudio/destAddr", destAddr); st.setValue("netaudio/keepOnExit", keepOnExit);
         st.setValue("netaudio/listenVolume", listenVol); st.setValue("netaudio/listenMute", listenMute);
+        st.setValue("netaudio/rxGain", rxGain);
         st.setValue("netaudio/txGate", txGate); st.setValue("netaudio/micSource", micSource);
         st.setValue("netaudio/txPort", txPort); st.setValue("netaudio/restoreBridge", restoreBridge);
         st.setValue("netaudio/txUnit", txUnit);
@@ -83,6 +98,7 @@ struct NetAudioCfg {
         if (!enabled()) return {};
         if (port < 1024 || port > 65533) return "Network audio port must be 1024-65533.";
         if (latencyMs < 20 || latencyMs > 2000) return "Network audio buffer must be 20-2000 ms.";
+        if (!(rxGain >= RX_GAIN_MIN && rxGain <= RX_GAIN_MAX)) return "RX gain must be 0.5x-10x (-6 to +20 dB).";
         if (!QList<int>{24, 32, 48, 64}.contains(opusKbps)) return "Opus bitrate must be 24, 32, 48 or 64 kbit/s.";
         if (!QStringList{"rs8m", "ldpc", "disable"}.contains(fec)) return "ROC FEC must be rs8m, ldpc or disable.";
         if (!QList<int>{5, 10, 20, 40}.contains(packetMs)) return "Packet size must be 5, 10, 20 or 40 ms.";
@@ -104,7 +120,8 @@ static NetAudioCfg naCfg;
 class NetAudio : public QObject {
 public:
     static constexpr const char *RECV_UNIT = "ft710-netaudio-recv", *SEND_UNIT = "ft710-netaudio-send",
-                                *NODE = "ft710_rx_net", *REMOTE_DIR = "$HOME/.config/ft710-netaudio";
+                                *NODE = "ft710_rx_net", *GAIN_NODE = "ft710_rx_net_gain", *RAW_NODE = "ft710_rx_net_raw",
+                                *REMOTE_DIR = "$HOME/.config/ft710-netaudio";
     std::function<void()> changed;            // UI refresh hook
     std::function<void(const QString &)> logLine;
 
@@ -148,7 +165,13 @@ public:
         resolve([this, adopt](bool ok) {
             if (!ok || !wanted) { emitChanged(); return; }
             health.start(); remotePoll.start();
-            if (adopt) { graceSince.restart(); startMeter(); syncListen(); pollRemote(); emitChanged(); return; }
+            if (adopt && !runningHasChain()) {   // receiver from an older version (no RX gain): rebuild it, ~1 s dropout
+                say("running receiver has no RX gain stage — restarting it");
+                busy = true;
+                restartLocal([this](bool) { busy = false; graceSince.restart(); silentSince.restart(); pollRemote(); emitChanged(); });
+                health.start(); remotePoll.start(); emitChanged(); return;
+            }
+            if (adopt) { chainRunning = true; graceSince.restart(); startMeter(); syncListen(); applyRxGain(); pollRemote(); emitChanged(); return; }
             restartBoth();
         });
         emitChanged();
@@ -177,6 +200,15 @@ public:
         QProcess p; p.start("systemctl", {"--user", "is-active", RECV_UNIT});
         p.waitForFinished(3000); return p.readAllStandardOutput().trimmed() == "active";
     }
+    // RX gain: saved, and applied live to the running receiver's filter-chain (no restart, no dropout;
+    // the plugin smooths the change over 20 ms). save=false: CLI test override.
+    void setRxGain(double g, bool save = true) {
+        naCfg.rxGain = NetAudioCfg::clampGain(g);
+        if (save) QSettings().setValue("netaudio/rxGain", naCfg.rxGain);
+        if (wanted) applyRxGain();
+    }
+    double appliedRxGain() const { return gainApplied; }
+    static QString receiverConfText() { return receiverConf(limiterPlugin()); }   // --print-receiver-conf
     void setListen(int vol, bool mute) {
         naCfg.listenVol = qBound(0, vol, 150); naCfg.listenMute = mute;
         QSettings().setValue("netaudio/listenVolume", naCfg.listenVol); QSettings().setValue("netaudio/listenMute", mute);
@@ -187,17 +219,49 @@ public:
     static QString tmpl(const QString &name, const QMap<QString, QString> &vars) {
         QFile f(":/netaudio/" + name);
         QString t = f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()) : QString();
+        if (vars.contains("RXGAIN_CHAIN")) t.replace("@RXGAIN_CHAIN@", vars["RXGAIN_CHAIN"]);   // inserted text is already filled in
         for (auto it = vars.begin(); it != vars.end(); ++it) t.replace("@" + it.key() + "@", it.value());
         return t;
     }
-    static QString receiverConf() {
+    // The RX gain/limiter LADSPA plugin is compiled into the app (Qt resource) and written out next to
+    // the receiver config, so a copied binary is all that's needed. Rewritten only when it changed
+    // (write + rename: a running receiver keeps its mapped copy). "" if it can't be written.
+    static QString limiterPlugin() {
+        QFile res(":/netaudio/ft710_rxlimit.so");
+        if (!res.open(QIODevice::ReadOnly)) return {};
+        const QByteArray so = res.readAll();
+        const QString dir = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath("FT-710_remote");
+        const QString path = dir + "/ft710_rxlimit.so";
+        QFile cur(path);
+        if (cur.open(QIODevice::ReadOnly) && cur.readAll() == so) return path;
+        cur.close();
+        QDir().mkpath(dir);
+        QFile tmp(path + ".tmp");
+        if (!tmp.open(QIODevice::WriteOnly | QIODevice::Truncate) || tmp.write(so) != so.size()) return {};
+        tmp.close();
+        QFile::remove(path);
+        return QFile::rename(path + ".tmp", path) ? path : QString();
+    }
+    static void put(QMap<QString, QString> &m, std::initializer_list<std::pair<QString, QString>> kv) { for (const auto &e : kv) m[e.first] = e.second; }
+    static QString receiverConf(const QString &plugin) {
         const NetAudioCfg &c = naCfg;
-        if (c.mode == 1)
-            return tmpl("receiver-roc.conf.in", {{"PORT_SOURCE", QString::number(c.port)}, {"PORT_REPAIR", QString::number(c.port + 1)},
-                        {"PORT_CONTROL", QString::number(c.port + 2)}, {"FEC", c.fec}, {"LATENCY", QString::number(c.latencyMs)}});
+        const bool chain = !plugin.isEmpty();
+        QMap<QString, QString> v;
+        v["RAW_NODE"] = chain ? RAW_NODE : NODE;
+        v["RAW_DESC"] = chain ? "FT-710 RX (network, before RX gain)" : "FT-710 RX (network)";
+        v["RXGAIN_CHAIN"] = chain ? tmpl("receiver-rxgain.inc.in", {{"NODE", NODE}, {"RAW_NODE", RAW_NODE}, {"DESC", "FT-710 RX (network)"},
+                                         {"PLUGIN", plugin}, {"GAIN", QString::number(NetAudioCfg::clampGain(c.rxGain), 'f', 4)},
+                                         {"CEILING", QString::number(NetAudioCfg::RX_CEILING_DB, 'f', 1)}})
+                                  : QString("    # RX gain unavailable (couldn't write the limiter plugin): unity gain\n");
+        if (c.mode == 1) {
+            put(v, {{"PORT_SOURCE", QString::number(c.port)}, {"PORT_REPAIR", QString::number(c.port + 1)},
+                      {"PORT_CONTROL", QString::number(c.port + 2)}, {"FEC", c.fec}, {"LATENCY", QString::number(c.latencyMs)}});
+            return tmpl("receiver-roc.conf.in", v);
+        }
         const bool opus = c.effCompression() == 1;
-        return tmpl("receiver-rtp.conf.in", {{"PORT", QString::number(c.port)}, {"LATENCY", QString::number(c.latencyMs)},
-                    {"MEDIA", opus ? "opus" : "audio"}, {"FORMAT_LINE", opus ? "" : "audio.format = \"S16BE\""}});
+        put(v, {{"PORT", QString::number(c.port)}, {"LATENCY", QString::number(c.latencyMs)},
+                  {"MEDIA", opus ? "opus" : "audio"}, {"FORMAT_LINE", opus ? "" : "audio.format = \"S16BE\""}});
+        return tmpl("receiver-rtp.conf.in", v);
     }
     // Returns the file name (sender.conf / sender.sh) and its contents.
     static QPair<QString, QString> senderFile(const QString &src, const QString &dest) {
@@ -218,6 +282,8 @@ private:
     QString srcNode, destIp, error, downWhy;
     QString localUnit = "unknown", remoteUnit = "unknown";
     int srcPresent = -1, backoff = 0, restarts = 0, failsInRow = 0, listenApplied = -1;
+    double gainApplied = -1;      // gain last confirmed on the running receiver (-1 unknown)
+    bool gainBusy = false, gainAgain = false, chainRunning = false;
     double level = -120;
     QTimer health, remotePoll, recover;
     QElapsedTimer silentSince, graceSince, upSince, lastData, lastLocalPoll;
@@ -292,17 +358,39 @@ private:
         return QString("systemctl --user stop %1 2>/dev/null; systemctl --user reset-failed %1 2>/dev/null; true\n").arg(shq(unit));
     }
 
+    static bool runningHasChain() {
+        QFile f(localDir() + "/receiver.conf");
+        return f.open(QIODevice::ReadOnly) && f.readAll().contains("ft710_rxlimit");
+    }
+    // pw-cli set-param on the filter-chain; one at a time, the latest value wins (slider drags).
+    void applyRxGain() {
+        if (!chainRunning) return;
+        if (gainBusy) { gainAgain = true; return; }
+        const double g = NetAudioCfg::clampGain(naCfg.rxGain);
+        gainBusy = true; gainAgain = false;
+        run("pw-cli", {"set-param", GAIN_NODE, "Props", QString("{ params = [ \"rx:Gain\" %1 ] }").arg(g, 0, 'f', 4)}, {}, 3000,
+            [this, g](bool ok, QByteArray) {
+                gainBusy = false;
+                if (ok) gainApplied = g; else say("RX gain: couldn't reach the receiver's gain stage");
+                if (gainAgain || (ok && std::abs(NetAudioCfg::clampGain(naCfg.rxGain) - g) > 1e-6)) applyRxGain();
+                emitChanged();
+            });
+    }
     void restartLocal(std::function<void(bool)> done) {
         killProc(meter); killProc(listen);
         const QString d = localDir();
+        const QString plugin = limiterPlugin();
+        if (plugin.isEmpty()) say("RX gain: couldn't write the limiter plugin — receiving at unity gain");
         const QString sc = startScript(RECV_UNIT, d, "FT-710 Remote network audio receiver", "pipewire -c \"$D/receiver.conf\"",
-                                       {{"receiver.conf", receiverConf()}}, {}, {});
+                                       {{"receiver.conf", receiverConf(plugin)}}, {}, {});
+        chainRunning = false; gainApplied = -1;
         localBusy = true;
         run("bash", {"-s"}, sc.toUtf8(), 8000, [this, done](bool, QByteArray out) {
             localBusy = false;
             const bool ok = kv(out).value("result") == "ok";
             localUnit = ok ? "active" : "failed";
-            say(ok ? "receiver started" : "receiver failed to start");
+            if (ok && runningHasChain()) { chainRunning = true; gainApplied = NetAudioCfg::clampGain(naCfg.rxGain); }
+            say(ok ? QString("receiver started (RX gain %1 dB)").arg(NetAudioCfg::gainDb(naCfg.rxGain), 0, 'f', 1) : "receiver failed to start");
             if (ok) QTimer::singleShot(700, this, [this] { if (wanted) { startMeter(); syncListen(); } });
             done(ok);
         });

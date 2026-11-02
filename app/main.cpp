@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <cmath>
+#include "tune.h"
 #include <QDomDocument>
 #include <QtDBus/QDBusInterface>
 #include <QtDBus/QDBusReply>
@@ -309,6 +310,7 @@ public:
     std::function<bool()> canTune;               // false while transmitting
     std::function<void(int)> onSpanCode;         // span code (0-9) from the frame header, when it changes
     bool clickToTune = true;
+    bool snapKHz = true;   // "Snap to kHz": click-to-tune lands on the nearest whole kHz
     bool autoContrast = false;                   // off: fixed colour scale, so the radio's scope LEVEL shows
     int lastSpanCode = -1;
 
@@ -381,7 +383,10 @@ protected:
         QString top = status;
         if (top.isEmpty() && span > 0) {
             top = QString("%1 kHz span%2").arg(span / 1000.0, 0, 'g', 4).arg(fixedEdge ? " (fixed)" : "");
-            if (hoverX >= 0) top += QString("   cursor %1 MHz").arg(freqAt(hoverX) / 1e6, 0, 'f', 4);
+            if (hoverX >= 0) {
+                top += QString("   cursor %1 MHz").arg(freqAt(hoverX) / 1e6, 0, 'f', 4);
+                if (clickToTune && snapKHz) top += QString(" → %1").arg(clickTuneHz(freqAt(hoverX), span, true) / 1e6, 0, 'f', 3);
+            }
             if (clickToTune) top += (canTune && !canTune()) ? "   (tuning disabled while TX)" : "   click to tune";
         }
         p.drawText(rect().adjusted(6, 4, -6, 0), Qt::AlignTop | Qt::AlignLeft, top);
@@ -398,9 +403,7 @@ protected:
         if (e->button() != Qt::LeftButton || !clickToTune || span <= 0 || !status.isEmpty()) return;
         if ((e->position() - pressPos).manhattanLength() > 6) return;
         if (canTune && !canTune()) return;
-        double hz = freqAt(e->position().x());
-        const double res = span <= 20000 ? 10 : span <= 200000 ? 100 : 500;   // round to a sensible step
-        hz = std::round(hz / res) * res;
+        const double hz = clickTuneHz(freqAt(e->position().x()), span, snapKHz);   // whole kHz, or a step that suits the span
         if (onTune && hz > 0) onTune(hz);
     }
 
@@ -563,7 +566,21 @@ public:
         auto *netName = new QLabel("RX network:");
         netLevel = new QProgressBar; netLevel->setRange(0, 60); netLevel->setValue(0); netLevel->setTextVisible(true);
         netLevel->setFormat("—"); netLevel->setMaximumWidth(140);
-        netLevel->setToolTip("Level received on \"FT-710 RX (network)\" (dBFS). Digital silence for more than 2 s counts as link down.");
+        netLevel->setToolTip("Level on \"FT-710 RX (network)\" after RX gain — what WSJT-X/fldigi get (dBFS). "
+                             "Digital silence for more than 2 s counts as link down.");
+        // RX gain: 0.1 dB steps, -6 .. +20 dB (0.5x .. 10x). Applied on this computer by a limiter that keeps
+        // peaks at -1 dBFS, so every position is clip-free. Changes are live (no restart).
+        auto *gainName = new QLabel("RX gain:");
+        netGain = new QSlider(Qt::Horizontal);
+        netGain->setRange(int(std::lround(NetAudioCfg::gainDb(NetAudioCfg::RX_GAIN_MIN) * 10)), int(std::lround(NetAudioCfg::gainDb(NetAudioCfg::RX_GAIN_MAX) * 10)));
+        netGain->setSingleStep(5); netGain->setPageStep(30); netGain->setTickPosition(QSlider::TicksBelow); netGain->setTickInterval(60);
+        netGain->setToolTip("RX gain of the network audio on this computer (-6 to +20 dB, default +9.5 dB = 3x like Mumble). "
+                            "A limiter holds peaks at -1 dBFS, so no setting clips. Sets what WSJT-X/fldigi and the "
+                            "listen monitor get from \"FT-710 RX (network)\". Double-click the value for the default.");
+        netGain->setMinimumWidth(90);
+        netGainLbl = new QLabel; netGainLbl->setMinimumWidth(netGainLbl->fontMetrics().horizontalAdvance("+20.0 dB "));
+        netGainLbl->setToolTip("RX gain (double-click: back to +9.5 dB)"); netGainLbl->installEventFilter(this);
+        setGainSlider(naCfg.rxGain);
         netVol = new QSlider(Qt::Horizontal); netVol->setRange(0, 150); netVol->setPageStep(5);
         netVol->setTickPosition(QSlider::TicksBelow); netVol->setTickInterval(25); netVol->setValue(naCfg.listenVol);
         netVol->setToolTip("Volume of the local listen monitor of the network stream (speakers). Does not change the level "
@@ -574,7 +591,7 @@ public:
                                "usually plays the radio audio already (mute one of them to avoid hearing it twice).");
         netStartBtn = new QPushButton("Start");
         netStartBtn->setToolTip("Start/stop the network audio stream (also started by Connect and stopped by Disconnect).");
-        nr->addWidget(netName); nr->addWidget(netLevel); nr->addWidget(netVol, 1); nr->addWidget(netVolLbl); nr->addWidget(netMuteBtn); nr->addWidget(netStartBtn);
+        nr->addWidget(netName); nr->addWidget(netLevel); nr->addWidget(gainName); nr->addWidget(netGain, 1); nr->addWidget(netGainLbl); nr->addWidget(netVol, 1); nr->addWidget(netVolLbl); nr->addWidget(netMuteBtn); nr->addWidget(netStartBtn);
         v->addWidget(netRow);
         // Direct TX (network mode, no Mumble): mic level of what PTT would send to the TX gate.
         micRow = new QWidget; auto *mr = new QHBoxLayout(micRow); mr->setContentsMargins(0, 0, 0, 0);
@@ -604,6 +621,12 @@ public:
         connect(netMuteBtn, &QToolButton::toggled, this, [this, syncMute](bool on) { syncMute(on); na->setListen(netVol->value(), on); });
         connect(netVol, &QSlider::valueChanged, this, [this](int val) { netVolLbl->setText(QString("%1%").arg(val)); netVolApply.start(); });
         netVolApply.setSingleShot(true); netVolApply.setInterval(100);
+        connect(netGain, &QSlider::valueChanged, this, [this](int v10) {
+            netGainLbl->setText(fmtGainDb(v10 / 10.0));
+            if (!gainSync) netGainApply.start();
+        });
+        netGainApply.setSingleShot(true); netGainApply.setInterval(80);   // live, coalesced while dragging
+        connect(&netGainApply, &QTimer::timeout, this, [this] { na->setRxGain(std::pow(10.0, netGain->value() / 200.0)); });
         connect(&netVolApply, &QTimer::timeout, this, [this] { na->setListen(netVol->value(), netMuteBtn->isChecked()); });
         connect(netStartBtn, &QPushButton::clicked, this, [this] { if (na->active()) na->stop(false); else na->start(); });
         na->changed = [this] { updateNetUi(); };
@@ -626,7 +649,10 @@ public:
         scopeTuneChk = new QCheckBox("Click to tune");
         scopeTuneChk->setToolTip("A single left click in the scope sets VFO-A to that frequency through flrig "
                                  "(rig.set_vfo). Disabled while transmitting. Never keys the radio.");
-        scopeRow->addWidget(scopeChk); scopeRow->addWidget(scopeTuneChk); scopeRow->addStretch(1);
+        scopeSnapChk = new QCheckBox("Snap to kHz");
+        scopeSnapChk->setToolTip("Click to tune rounds to the nearest whole kHz (3.788678 MHz → 3.789000 MHz). "
+                                 "Off: rounds to 10/100/500 Hz depending on the span.");
+        scopeRow->addWidget(scopeChk); scopeRow->addWidget(scopeTuneChk); scopeRow->addWidget(scopeSnapChk); scopeRow->addStretch(1);
         v->addLayout(scopeRow);
         // Scope SPAN and LEVEL on the radio (CAT SS05 / SS04 via flrig rig.cat_string: display settings only)
         scopeCtl = new QWidget;
@@ -681,11 +707,15 @@ public:
             QSettings st;
             scopeTuneChk->setChecked(st.value("scopeClickTune", true).toBool());
             scope->clickToTune = scopeTuneChk->isChecked();
+            scopeSnapChk->setChecked(st.value("scopeSnapKHz", true).toBool());
+            scope->snapKHz = scopeSnapChk->isChecked();
+            scopeSnapChk->setEnabled(scope->clickToTune);
             scopeChk->setChecked(st.value("showScope", true).toBool());
         }
         connect(scopeTuneChk, &QCheckBox::toggled, this, [this](bool on) {
-            QSettings().setValue("scopeClickTune", on); scope->clickToTune = on; scope->update();
+            QSettings().setValue("scopeClickTune", on); scope->clickToTune = on; scopeSnapChk->setEnabled(on); scope->update();
         });
+        connect(scopeSnapChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("scopeSnapKHz", on); scope->snapKHz = on; scope->update(); });
         connect(scopeChk, &QCheckBox::toggled, this, [this](bool on) { QSettings().setValue("showScope", on); showScope(on); });
         showScope(scopeChk->isChecked());
 
@@ -804,6 +834,9 @@ public:
 
 protected:
     bool eventFilter(QObject *o, QEvent *e) override {
+        if (o == netGainLbl && e->type() == QEvent::MouseButtonDblClick) {   // RX gain value: back to the default
+            netGainApply.stop(); setGainSlider(NetAudioCfg().rxGain); na->setRxGain(NetAudioCfg().rxGain); return true;
+        }
         if (e->type() == QEvent::KeyPress || e->type() == QEvent::KeyRelease) {
             auto *k = static_cast<QKeyEvent *>(e);
             if (k->key() == Qt::Key_Space && isActiveWindow() && !QApplication::activeModalWidget()) {
@@ -845,7 +878,7 @@ private:
 private:
     QPushButton *connectBtn, *disconnectBtn, *ptt, *txBtn, *restartBtn;
     // --- band scope ---
-    QCheckBox *scopeChk, *scopeTuneChk;
+    QCheckBox *scopeChk, *scopeTuneChk, *scopeSnapChk;
     ScopeWidget *scope;
     bool radioRx = false;          // flrig last reported PTT=0 (tuning by click is only allowed then)
     QProcess *tuneProc = nullptr;
@@ -914,7 +947,7 @@ private:
     void showScope(bool on) {
         if (geomReady) { geomSave.stop(); saveGeom(on ? 0 : 1); }   // remember the size for the state we're leaving
         const bool remembered = geomReady && !QSettings().value(geomKey(on)).toByteArray().isEmpty();
-        scope->setVisible(on); scopeTuneChk->setVisible(on); scopeCtl->setVisible(on);
+        scope->setVisible(on); scopeTuneChk->setVisible(on); scopeSnapChk->setVisible(on); scopeCtl->setVisible(on);
         if (remembered) QTimer::singleShot(0, this, [this] { restoreSavedGeometry(); });
         if (on) { queryLevel(); lvlPoll.start(); } else lvlPoll.stop();
         if (on) {
@@ -1049,6 +1082,14 @@ private:
     // --- network audio ---
     NetAudio *na; QWidget *netRow; QProgressBar *netLevel; QSlider *netVol; QLabel *netVolLbl, *netLbl;
     QToolButton *netMuteBtn; QPushButton *netStartBtn; QFormLayout *statusForm = nullptr; QTimer netVolApply;
+    QSlider *netGain; QLabel *netGainLbl; QTimer netGainApply; bool gainSync = false;
+    static QString fmtGainDb(double db) { return QString("%1%2 dB").arg(db >= 0 ? "+" : "").arg(db, 0, 'f', 1); }
+    // Show a gain without re-saving it (the stored 3.0 stays exactly 3.0 unless the user moves the slider).
+    void setGainSlider(double g) {
+        gainSync = true; netGain->setValue(int(std::lround(NetAudioCfg::gainDb(NetAudioCfg::clampGain(g)) * 10))); gainSync = false;
+        netGainLbl->setText(fmtGainDb(NetAudioCfg::gainDb(NetAudioCfg::clampGain(g))));
+    }
+
     // --- direct TX (TX gate) ---
     TxLink *tx; QWidget *micRow; QProgressBar *micBar; QLabel *micDev, *txgLbl; QTimer micUi;
     bool talkNet = false;          // the current over goes through the TX gate (not Mumble)
@@ -1866,7 +1907,9 @@ static void migrateLegacySettings() {
 
 // Headless network-audio control (--netaudio start|stop|status|watch SECONDS). Overrides for a test
 // run without touching the saved settings: --na-mode roc|rtp, --na-compression none|opus,
-// --na-bitrate 24|32|48|64, --na-port N, --na-latency MS, --na-packet MS.
+// --na-bitrate 24|32|48|64, --na-port N, --na-latency MS, --na-packet MS,
+// --na-rx-gain X (linear 0.5-10, or dB like 9.5dB; with "start" it goes into the receiver config,
+// with status/watch it's set live on the running receiver; never saved).
 static int netaudioCli(QApplication &app, const QStringList &args, int i) {
     QTextStream out(stdout);
     auto opt = [&](const QString &k) { int j = args.indexOf(k); return j >= 0 && j + 1 < args.size() ? args[j + 1] : QString(); };
@@ -1876,6 +1919,8 @@ static int netaudioCli(QApplication &app, const QStringList &args, int i) {
     if (QString p = opt("--na-port"); !p.isEmpty()) naCfg.port = p.toInt();
     if (QString l = opt("--na-latency"); !l.isEmpty()) naCfg.latencyMs = l.toInt();
     if (QString p = opt("--na-packet"); !p.isEmpty()) naCfg.packetMs = p.toInt();
+    const QString gainOpt = opt("--na-rx-gain");
+    if (!gainOpt.isEmpty()) naCfg.rxGain = NetAudioCfg::parseGain(gainOpt);   // validate() rejects out-of-range / garbage
     else if (naCfg.effCompression() == 1 && naCfg.packetMs < 20 && !args.contains("--na-packet")) naCfg.packetMs = 20;
     const QString cmd = i + 1 < args.size() ? args[i + 1] : "status";
     if (!naCfg.enabled() && cmd != "stop") { out << "netaudio: mode is Mumble (set Settings > Network audio, or --na-mode roc|rtp)" << Qt::endl; return 2; }
@@ -1888,6 +1933,7 @@ static int netaudioCli(QApplication &app, const QStringList &args, int i) {
     if (cmd != "start" && !adopt) { out << "netaudio: not running (local unit inactive)" << Qt::endl; return 1; }
     out << "netaudio: " << naCfg.describe() << (adopt ? " (monitoring the running stream)" : "") << Qt::endl;
     na.start(adopt);
+    if (adopt && !gainOpt.isEmpty()) na.setRxGain(naCfg.rxGain, false);
     QElapsedTimer t; t.start(); int lastSec = -1; bool wasUp = false;
     QTimer tick; tick.setInterval(250);
     QObject::connect(&tick, &QTimer::timeout, &app, [&] {
@@ -1951,7 +1997,7 @@ static int txgateCli(QApplication &app, const QStringList &args, int i) {
 int main(int argc, char **argv) {
     {   // command-line-only modes work without a display
         bool cli = false;
-        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio") || !strcmp(argv[k], "--txgate-test")) cli = true;
+        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio") || !strcmp(argv[k], "--txgate-test") || !strcmp(argv[k], "--print-receiver-conf")) cli = true;
         if (cli && qEnvironmentVariableIsEmpty("DISPLAY") && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) qputenv("QT_QPA_PLATFORM", "offscreen");
     }
     QApplication app(argc, argv);
@@ -1977,10 +2023,16 @@ int main(int argc, char **argv) {
           << "\nnetaudio=" << naCfg.describe() << " port=" << naCfg.port << " source=" << (naCfg.sourceNode.isEmpty() ? "RB_SOURCE" : naCfg.sourceNode)
           << " dest=" << (naCfg.destAddr.isEmpty() ? "auto" : naCfg.destAddr) << " keepOnExit=" << naCfg.keepOnExit
           << " listen=" << (naCfg.listenMute ? "muted" : QString::number(naCfg.listenVol) + "%")
+          << " rxGain=" << QString::number(naCfg.rxGain, 'f', 2) << "x (" << QString::number(NetAudioCfg::gainDb(naCfg.rxGain), 'f', 1) << " dB)"
+          << " clickTune=" << QSettings().value("scopeClickTune", true).toBool() << " snapKHz=" << QSettings().value("scopeSnapKHz", true).toBool()
           << "\ntx=" << (naCfg.txNet() ? "tx-gate" : "mumble") << " gatePort=" << naCfg.txPort << " unit=" << naCfg.txUnit
           << " mic=" << (naCfg.micSource.isEmpty() ? "default" : naCfg.micSource) << " restoreBridge=" << naCfg.restoreBridge
           << "\nvalid=" << (cfg.validate().isEmpty() ? "yes" : cfg.validate())
           << (naCfg.validate().isEmpty() ? "" : " netaudio: " + naCfg.validate()) << Qt::endl;
+        return 0;
+    }
+    if (app.arguments().contains("--print-receiver-conf")) {   // debugging: the PipeWire receiver config the app would write
+        QTextStream(stdout) << NetAudio::receiverConfText();
         return 0;
     }
     if (int i = app.arguments().indexOf("--netaudio"); i >= 0) return netaudioCli(app, app.arguments(), i);
@@ -2026,6 +2078,8 @@ int main(int argc, char **argv) {
             for (auto *b : w.findChildren<QToolButton *>()) out << "toolbutton: " << b->text() << (b->isEnabled() ? "" : " [disabled]") << (b->isVisible() ? "" : " [hidden]") << "\n";
             for (auto *sl : w.findChildren<QSlider *>()) out << "slider: " << sl->toolTip().left(40) << " value=" << sl->value()
                                                             << (sl->isEnabled() ? "" : " [disabled]") << (sl->isVisible() ? "" : " [hidden]") << "\n";
+            for (auto *c : w.findChildren<QCheckBox *>()) out << "checkbox: " << c->text() << (c->isChecked() ? " [checked]" : "")
+                                                              << (c->isEnabled() ? "" : " [disabled]") << (c->isVisible() ? "" : " [hidden]") << "\n";
             app.quit();
         });
     return app.exec();
