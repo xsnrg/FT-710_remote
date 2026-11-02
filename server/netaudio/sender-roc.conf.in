@@ -1,7 +1,7 @@
 # FT-710 Remote network audio: rig-host sender, ROC (roc-toolkit, PCM + FEC).
 # Template: ft710-remote fills in the @...@ values and writes ~/.config/ft710-netaudio/sender.conf
 # on the rig host. Receive audio only: it reads the radio's USB capture node (shared with
-# radio-bridge, WSJT-X, ...) and never writes to the radio. Run as its own PipeWire client:
+# WSJT-X, ...) and never writes to the radio. Run as its own PipeWire client:
 #   pipewire -c ~/.config/ft710-netaudio/sender.conf
 context.properties = { log.level = 2 }
 context.spa-libs = {

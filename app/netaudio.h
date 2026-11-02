@@ -1,6 +1,6 @@
 // Network audio ("LAN stream"): the FT-710's receive audio sent straight from the rig host to this
-// computer with PipeWire, as an alternative to listening through Mumble. Receive-only: nothing here
-// ever plays audio into the radio or keys it; PTT/TX keep using Mumble + radio-bridge.
+// computer with PipeWire. Receive-only: nothing here ever plays audio into the radio or keys it
+// (TX goes through the TX gate, txgate.h).
 //
 //   rig host:  ft710-netaudio-send  (pipewire roc-sink / rtp-sink, or GStreamer opusenc for Opus)
 //              reads the radio's USB capture node (shared, read-only) and sends it to this computer.
@@ -18,18 +18,18 @@
 // Included by main.cpp after Config / shq() / sshArgs(); not a standalone header.
 
 struct NetAudioCfg {
-    int mode = 0;                 // 0 = Mumble (no LAN stream), 1 = ROC, 2 = RTP
+    int mode = 1;                 // 1 = ROC, 2 = RTP (an old 0 = Mumble setting loads as ROC)
     int compression = 0;          // 0 = none (L16), 1 = Opus (RTP only; ROC 0.4 is PCM-only)
     int opusKbps = 32;            // 24 / 32 / 48 / 64
     int port = 10001;             // RTP: this port; ROC: port, port+1 (repair), port+2 (control)
     int latencyMs = 120;          // receiver buffer
     int packetMs = 10;            // RTP packet (ptime); L16 max 10 ms (fits a 1280-byte MTU)
     QString fec = "rs8m";         // ROC FEC: rs8m, ldpc, disable
-    QString sourceNode;           // rig host capture node; "" = RB_SOURCE from the bridge's bridge.env
+    QString sourceNode;           // rig host capture node; "" = RB_SOURCE from bridge.env in the rig config dir
     QString destAddr;             // address the rig host sends to; "" = this computer as seen by ssh
     bool keepOnExit = false;      // leave the stream running when the app quits
     int listenVol = 100;          // local monitor (speakers) of the network stream
-    double rxGain = 3.0;          // RX gain on this computer, linear (3x = +9.5 dB, same as radio-bridge's Mumble gain)
+    double rxGain = 3.0;          // RX gain on this computer, linear (3x = +9.5 dB)
     static constexpr double RX_GAIN_MIN = 0.5, RX_GAIN_MAX = 10.0, RX_CEILING_DB = -1.0;
     static double gainDb(double g) { return 20.0 * std::log10(g); }
     static double clampGain(double g) { return std::isfinite(g) ? qBound(RX_GAIN_MIN, g, RX_GAIN_MAX) : 3.0; }
@@ -39,20 +39,16 @@ struct NetAudioCfg {
         bool ok = false; const double v = t.trimmed().toDouble(&ok);
         return !ok ? std::nan("") : db ? std::pow(10.0, v / 20.0) : v;
     }
-    bool listenMute = true;       // muted by default: Mumble usually plays the RX audio already
-    // TX without Mumble (network modes): mic -> RTP -> ft710-txgate on the rig host, PTT over its TCP control link
-    bool txGate = true;           // network mode: PTT/TX through the TX gate (false = Mumble + radio-bridge as before)
+    bool listenMute = false;      // the listen monitor is the only local playback of the radio
+    // TX: mic -> RTP -> ft710-txgate on the rig host, PTT over its TCP control link
     QString micSource;            // PipeWire capture node for the mic; "" = default input
     int txPort = 10010;           // TX gate TCP control + UDP audio port on the rig host
-    bool restoreBridge = true;    // Disconnect / quit: stop the TX gate and start radio-bridge again
     QString txUnit = "ft710-txgate";   // systemd --user unit of the gate on the rig host
 
     bool enabled() const { return mode == 1 || mode == 2; }
-    bool txNet() const { return enabled() && txGate; }
     int effCompression() const { return mode == 2 ? compression : 0; }
-    QString modeName() const { return mode == 1 ? "ROC" : mode == 2 ? "RTP" : "Mumble"; }
+    QString modeName() const { return mode == 2 ? "RTP" : "ROC"; }
     QString describe() const {
-        if (!enabled()) return "Mumble";
         QString s = modeName() + " · " + (effCompression() ? QString("Opus %1 kbit/s").arg(opusKbps) : QString("L16"));
         if (mode == 1) s += " · FEC " + fec;
         if (mode == 2) s += QString(" · %1 ms packets").arg(packetMs);
@@ -60,7 +56,7 @@ struct NetAudioCfg {
     }
     void load() {
         QSettings st; NetAudioCfg d;
-        mode = qBound(0, st.value("netaudio/mode", d.mode).toInt(), 2);
+        mode = st.value("netaudio/mode", d.mode).toInt() == 2 ? 2 : 1;   // 0 (the removed Mumble mode) -> ROC
         compression = qBound(0, st.value("netaudio/compression", d.compression).toInt(), 1);
         opusKbps = st.value("netaudio/opusKbps", d.opusKbps).toInt();
         port = st.value("netaudio/port", d.port).toInt();
@@ -73,10 +69,8 @@ struct NetAudioCfg {
         listenVol = qBound(0, st.value("netaudio/listenVolume", d.listenVol).toInt(), 150);
         listenMute = st.value("netaudio/listenMute", d.listenMute).toBool();
         rxGain = clampGain(st.value("netaudio/rxGain", d.rxGain).toDouble());
-        txGate = st.value("netaudio/txGate", d.txGate).toBool();
         micSource = st.value("netaudio/micSource").toString().trimmed();
         txPort = st.value("netaudio/txPort", d.txPort).toInt();
-        restoreBridge = st.value("netaudio/restoreBridge", d.restoreBridge).toBool();
         txUnit = st.value("netaudio/txUnit", d.txUnit).toString().trimmed();
     }
     void save() const {
@@ -88,8 +82,7 @@ struct NetAudioCfg {
         st.setValue("netaudio/destAddr", destAddr); st.setValue("netaudio/keepOnExit", keepOnExit);
         st.setValue("netaudio/listenVolume", listenVol); st.setValue("netaudio/listenMute", listenMute);
         st.setValue("netaudio/rxGain", rxGain);
-        st.setValue("netaudio/txGate", txGate); st.setValue("netaudio/micSource", micSource);
-        st.setValue("netaudio/txPort", txPort); st.setValue("netaudio/restoreBridge", restoreBridge);
+        st.setValue("netaudio/micSource", micSource); st.setValue("netaudio/txPort", txPort);
         st.setValue("netaudio/txUnit", txUnit);
     }
     static bool nodeOk(const QString &n) { static const QRegularExpression re("^[A-Za-z0-9_][A-Za-z0-9._:@+-]{0,200}$"); return re.match(n).hasMatch(); }
@@ -105,13 +98,11 @@ struct NetAudioCfg {
         if (mode == 2 && effCompression() == 0 && packetMs > 10) return "Uncompressed (L16) RTP packets can be at most 10 ms (MTU).";
         if (!sourceNode.isEmpty() && !nodeOk(sourceNode)) return "Source node: use the PipeWire node name (pactl list short sources).";
         if (!destAddr.isEmpty() && !ipOk(destAddr)) return "Send-to address must be an IPv4/IPv6 address (blank = automatic).";
-        if (txGate) {
-            if (txPort < 1024 || txPort > 65535) return "TX gate port must be 1024-65535.";
-            if (txPort >= port && txPort <= port + 2) return "TX gate port must differ from the receive ports.";
-            if (!micSource.isEmpty() && !nodeOk(micSource)) return "Microphone: use the PipeWire node name (pactl list short sources).";
-            static const QRegularExpression unit("^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,100}$");
-            if (!unit.match(txUnit).hasMatch()) return "TX gate service: invalid unit name.";
-        }
+        if (txPort < 1024 || txPort > 65535) return "TX gate port must be 1024-65535.";
+        if (txPort >= port && txPort <= port + 2) return "TX gate port must differ from the receive ports.";
+        if (!micSource.isEmpty() && !nodeOk(micSource)) return "Microphone: use the PipeWire node name (pactl list short sources).";
+        static const QRegularExpression unit("^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,100}$");
+        if (!unit.match(txUnit).hasMatch()) return "TX gate service: invalid unit name.";
         return {};
     }
 };
@@ -146,7 +137,6 @@ public:
     QString remoteState() const { return remoteUnit; }
 
     QString statusText() const {
-        if (!naCfg.enabled()) return "off (Mumble mode)";
         if (!wanted) return "stopped — " + naCfg.describe();
         if (!error.isEmpty()) return error;
         QString s;

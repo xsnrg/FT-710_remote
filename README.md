@@ -1,28 +1,37 @@
 # FT-710_remote
 
-Remote operation of a Yaesu FT-710 over a LAN or VPN: receive and transmit audio
-through a Mumble server, or Mumble-free with PipeWire network audio and a direct TX gate,
-push-to-talk, RX/TX level control, and a live band scope (spectrum + waterfall) with
-click-to-tune.
+Remote operation of a Yaesu FT-710 over a LAN or VPN: receive audio streamed with PipeWire
+(ROC or RTP), push-to-talk with your microphone through an authenticated TX gate, TX level
+control, and a live band scope (spectrum + waterfall) with click-to-tune.
 
 It has two halves:
 
-* **Client app** (`app/`, Qt 6, C++) – runs on the operator's Linux desktop next to the
-  Mumble client.
-* **Rig-side services** (`server/`, Python) – run on the Linux machine that is
-  USB-connected to the FT-710, next to flrig and a Mumble server (murmur).
+* **Client app** (`app/`, Qt 6, C++) – runs on the operator's Linux desktop.
+* **Rig-side services** (`server/`, Python + PipeWire) – run on the Linux machine that is
+  USB-connected to the FT-710, next to flrig.
+
+> **Mumble was removed.** Earlier versions carried audio and PTT through a Mumble server
+> (murmur), the Mumble client and a `radio-bridge` bot. That code, its unit file and the
+> Mumble mode of the app are in git tag **`last-with-mumble`**
+> (`git checkout last-with-mumble -- server/radio-bridge systemd/radio-bridge.service`).
+> Settings from a Mumble-era install still load: the old Mumble keys are ignored and dropped
+> on the next Settings → OK, and the old "Mumble" audio mode becomes ROC.
 
 ![FT-710 Remote client showing the band scope and waterfall on 20 m](docs/screenshot.png)
 
+*(Screenshot from the Mumble-era version; the scope part is unchanged.)*
+
 ## Features
 
-* **Mumble bridge** – `radio_bridge.py` joins your Mumble server as a bot user
-  (default `FT710`). Radio receive audio is sent to Mumble; Mumble speech from you is
-  played into the radio's USB audio input and keys the transmitter through flrig.
-* **PTT** – hold-to-talk in the client (it drives Mumble's push-to-talk; the bridge keys
-  the rig only while your voice packets arrive, then unkeys after a short hang time).
-* **RX / TX levels** – RX is your local Mumble playback volume; TX is a gain the bridge
-  applies before the radio (stored on the rig host in `tx_gain`).
+* **Network receive audio** – the rig host streams the radio's receive audio straight to the
+  desktop with PipeWire (ROC with FEC, or RTP; optional Opus compression for VPN use). It
+  appears as the input device **"FT-710 RX (network)"** for WSJT-X, fldigi etc., and
+  **Listen** plays it on your speakers. See [Network audio](#network-audio).
+* **PTT / TX** – hold the PTT button (or Space): your microphone goes to `ft710_txgate.py`
+  on the rig host, which keys flrig only on an explicit PTT from the app and unkeys on its own
+  if the app, the network or the audio goes away. See [TX gate](#tx-gate).
+* **TX level** – a gain the TX gate applies before the radio (stored on the rig host in `tx_gain`).
+  **RX gain** – applied on the desktop to the received stream (−6 to +20 dB, limiter, no clipping).
 * **Band scope** – `ft710_scope.py` reads the FT-710's own scope data from the radio's
   internal FTDI FT4222 USB-to-SPI bridge, which appears on USB only when
   **MENU → SCU-LAN10 = ON**. The client shows spectrum + waterfall, with span and
@@ -42,75 +51,59 @@ It has two halves:
   that radio-reported centre for the frequency axis; older builds assumed dial-centred and drew
   everything 1.5 kHz too high in LSB, so clicks on a signal landed ~1.5–2 kHz off.
   Settings: `scopeSnapKHz`, `scopeSnapStep` (500/1000), `scopeSsbOffset` (0–3000 Hz).
-* **Network audio (optional, receive only)** – instead of hearing the radio only through
-  Mumble, the rig host streams the radio's receive audio straight to the desktop with
-  PipeWire (ROC with FEC, or RTP; optional Opus compression for VPN use). It appears as the
-  input device **"FT-710 RX (network)"** for WSJT-X, fldigi etc. See [Network audio](#network-audio).
-* **Direct TX (optional, Mumble-free)** – with network audio, PTT and your microphone can go
-  straight to `ft710_txgate.py` on the rig host instead of through Mumble. The gate keys flrig
-  only on an explicit PTT from the app and unkeys on its own if the app, the network or the
-  audio goes away. See [Direct TX](#direct-tx-mumble-free).
-* Status of murmur, the bridge, flrig and `tx_enabled` polled over ssh.
+* Status of flrig PTT, the VFO, `tx_enabled`, the stream and the TX gate polled over ssh.
 * Window size, volumes and scope settings remembered between runs.
-* Optional: start Mumble minimized (hidden in its tray icon). **Disconnect…** offers to close
-  Mumble the normal way (WM_DELETE_WINDOW, like its own close button), even while hidden.
 
 ## Architecture
 
 ```
  operator desktop                                   rig host (USB to FT-710)
- ┌──────────────────────────┐                       ┌──────────────────────────────────┐
- │ ft710-remote (Qt)        │──ssh (status, flrig──▶│ flrig  ──CAT──▶ FT-710           │
- │   │  click-to-tune, levels)   curl, tx_gain)     │ radio-bridge (pymumble) ◀─USB audio─▶ FT-710
- │   │ D-Bus / RPC          │                       │   │ keys PTT via flrig XML-RPC   │
- │   ▼                      │                       │   ▼                              │
- │ Mumble client ◀──────────┼──── Mumble (64738) ──▶│ murmur                           │
- │ band scope view ◀────────┼──── TCP 7355 ────────│ ft710-scope ◀─FT4222 SPI── FT-710 │
- └──────────────────────────┘                       └──────────────────────────────────┘
+ ┌──────────────────────────┐                       ┌──────────────────────────────────────┐
+ │ ft710-remote (Qt)        │──ssh (status, flrig──▶│ flrig  ──CAT──▶ FT-710               │
+ │  click-to-tune, levels)  │   curl, tx_gain)      │                                      │
+ │ "FT-710 RX (network)" ◀──┼── UDP ROC/RTP 10001 ──│ ft710-netaudio-send ◀─USB audio─ FT-710
+ │ mic, PTT ────────────────┼── TCP+UDP 10010 ─────▶│ ft710-txgate ──USB audio──▶ FT-710   │
+ │                          │                       │   └─ keys PTT via flrig XML-RPC      │
+ │ band scope view ◀────────┼──── TCP 7355 ────────│ ft710-scope ◀─FT4222 SPI── FT-710     │
+ └──────────────────────────┘                       └──────────────────────────────────────┘
 ```
 
 * The client never talks to the radio directly. CAT goes through flrig on the rig host
   (flrig owns the serial port), reached as `ssh <rig> curl http://127.0.0.1:12345/RPC2`.
 * ssh uses ControlMaster connection sharing, so polls are cheap. Set up key-based login.
-* The scope streamer is receive-only: it reads frames from the FT4222 and never writes
-  to the radio.
+* The stream sender and the scope streamer are receive-only: they never write to the radio.
+  The TX gate is the only thing that plays into the radio and the only thing that keys it.
 
 ## Requirements
 
-Client (operator desktop, Linux, X11 or XWayland):
-* Qt 6 (Widgets, Network, Xml, DBus), CMake ≥ 3.21, a C++17 compiler
-* libxcb and libopus (dev packages), pkg-config
-* Mumble client (1.4+) with its RPC/D-Bus interface, PipeWire or PulseAudio (`pactl`)
+Client (operator desktop, Linux):
+* Qt 6 (Widgets, Network), CMake ≥ 3.21, a C++17 compiler
+* libopus (dev package), pkg-config
+* PipeWire ≥ 1.0 (`pipewire`, `pw-record`, `pw-loopback`, `pactl`); `pipewire-module-roc` for ROC
 * OpenSSH client with key login to the rig host
 
 Rig host (Linux):
 * flrig, configured for the FT-710 with XML-RPC enabled (default port 12345)
-* Mumble server (murmur / mumble-server)
-* Python 3 with `pymumble`, `opuslib`, `protobuf` (`server/radio-bridge/requirements.txt`),
-  PipeWire or PulseAudio (`pactl`, `pacat`), `curl`
+* PipeWire (`pactl`, `pacat`), `pipewire-module-roc` for ROC, GStreamer for Opus (see below), `curl`
+* Python 3 (TX gate: standard library; libopus for Opus TX)
 * FTDI **libft4222** (for the band scope; see below)
 
-Debian/Ubuntu example (client): `sudo apt install qt6-base-dev libxcb1-dev libopus-dev cmake g++ pkg-config mumble`
+Debian/Ubuntu example (client): `sudo apt install qt6-base-dev libopus-dev cmake g++ pkg-config pipewire-roc`
 
 ## Rig-side setup
 
 1. **flrig**: run it on the rig host with the FT-710 CAT port; enable XML-RPC.
-2. **Mumble server**: install murmur, set a server password if you want one.
-3. **Bridge**:
+2. **Rig config dir** (`~/.config/radio-bridge/` – the name is historical):
    ```sh
-   mkdir -p ~/radio-bridge && cp server/radio-bridge/radio_bridge.py ~/radio-bridge/
-   python3 -m venv ~/radio-bridge/venv
-   ~/radio-bridge/venv/bin/pip install -r server/radio-bridge/requirements.txt
    mkdir -p ~/.config/radio-bridge
-   cp server/radio-bridge/bridge.env.example ~/.config/radio-bridge/bridge.env   # edit RB_SOURCE / RB_SINK
-   # optional server password (never commit it):
-   install -m 600 /dev/null ~/.config/radio-bridge/server.pw && $EDITOR ~/.config/radio-bridge/server.pw
-   cp systemd/radio-bridge.service ~/.config/systemd/user/
-   systemctl --user daemon-reload && systemctl --user enable --now radio-bridge
+   cp server/ft710-txgate/bridge.env.example ~/.config/radio-bridge/bridge.env   # set RB_SOURCE / RB_SINK
    ```
    Find the radio's USB audio names with `pactl list short sources` / `pactl list short sinks`.
-   For user services that must run without a login session: `loginctl enable-linger $USER`.
-4. **Band scope**:
+   `tx_enabled` in this dir arms TX keying (the app's "Enable TX keying" button creates or
+   removes it); `tx_gain` holds the TX level.
+3. **TX gate**: see [TX gate](#tx-gate) (installed, not enabled; the app starts it).
+4. **Network audio sender**: nothing to install; the app writes its config and runs it over ssh.
+5. **Band scope**:
    ```sh
    mkdir -p ~/ft710-scope && cp server/ft710-scope/ft710_scope.py ~/ft710-scope/
    # put libft4222.so in ~/ft710-scope/lib/ (see "FTDI library")
@@ -121,6 +114,8 @@ Debian/Ubuntu example (client): `sudo apt install qt6-base-dev libxcb1-dev libop
    ```
    Turn **MENU → SCU-LAN10 ON** on the radio, then check with
    `python3 ~/ft710-scope/ft710_scope.py analyze`.
+
+For user services that must run without a login session: `loginctl enable-linger $USER`.
 
 ### udev rule (FT4222 access)
 
@@ -150,52 +145,41 @@ cmake --install build          # installs bin/ft710-remote and a .desktop file
 On first start the **Settings…** dialog opens. Tabs:
 
 * **Rig host** – ssh destination (`host`, `user@host` or an `~/.ssh/config` alias),
-  flrig host/port as seen from the rig host, bridge service name, bridge config dir,
-  the bridge's Mumble user name, the Mumble server service name; a "Test ssh" button.
-* **Mumble** – server (blank = rig host), port, your user name, channel, and where the
-  server password comes from: read `server.pw` on the rig host over ssh, none (use
-  Mumble's saved login), or stored locally in the settings file; "start Mumble minimized".
+  flrig host/port as seen from the rig host, the rig config dir; a "Test ssh" button.
 * **Band scope** – streamer host (blank = rig host) and port.
-* **Network audio** – audio mode (Mumble / LAN stream ROC / LAN stream RTP), compression,
-  port, buffer, packet size, ROC FEC, source node, send-to address. See below.
+* **Network audio / TX** – RX stream (ROC / RTP), compression, port, buffer, packet size,
+  ROC FEC, source node, send-to address; microphone, TX gate port and service. See below.
 * **General** – station label for the window title, optional help/notes file, path of
   the settings file.
 
 Changes are validated and apply immediately, no restart. Settings live in
-`~/.config/FT-710_remote/ft710-remote.conf` (a locally stored password is plain text
-in that file, which the app keeps owner-only (mode 600); prefer the ssh or saved-login options).
-`ft710-remote --print-config` prints the effective settings (without the password)
-and exits.
+`~/.config/FT-710_remote/ft710-remote.conf`.
+`ft710-remote --print-config` prints the effective settings and exits.
 
 Settings from an older build (`~/.config/<anything>/ft710-remote.conf`) are imported
 once on first start; keys already present are not overwritten.
 
 ## Network audio
 
-**Settings → Network audio → Audio mode**:
+**Settings → Network audio / TX → RX stream**:
 
 | Mode | What it does |
 |---|---|
-| **Mumble** (default) | As before: radio audio only through Mumble. |
-| **LAN stream: ROC** | PipeWire `roc-sink` on the rig host → `roc-source` on the desktop, Reed-Solomon FEC (`rs8m`) repairs lost packets. Recommended on a LAN. L16 only. |
-| **LAN stream: RTP** | PipeWire `rtp-sink` → `rtp-source`. Compression **None** (L16) or **Opus 24/32/48/64 kbit/s** for VPN / slow links. |
+| **ROC** (default) | PipeWire `roc-sink` on the rig host → `roc-source` on the desktop, Reed-Solomon FEC (`rs8m`) repairs lost packets. Recommended on a LAN. L16 only. |
+| **RTP** | PipeWire `rtp-sink` → `rtp-source`. Compression **None** (L16) or **Opus 24/32/48/64 kbit/s** for VPN / slow links. |
 
-The stream itself is **receive only**. With **PTT / TX audio = Mumble** (default) PTT and TX
-audio still go through Mumble and radio-bridge exactly as before (keep Mumble connected for PTT;
-mute Mumble's playback or leave the app's "Listen" off so you do not hear the radio twice).
-With **PTT / TX audio = Direct to the TX gate** Mumble is not used at all; see
-[Direct TX](#direct-tx-mumble-free).
+The stream itself is **receive only**; transmit goes through the [TX gate](#tx-gate).
 
 How it works:
-* **Connect** starts the stream (and Mumble as usual), **Disconnect** stops it, and it is
+* **Connect** starts the stream and the TX gate, **Disconnect** stops both, and the stream is
   stopped when the app quits (unless "keep streaming" is ticked). The **Start/Stop** button in
-  the "RX network" row controls it on its own.
+  the "RX network" row controls the stream on its own.
 * The app writes the configs from built-in templates and runs them as systemd **user** units:
   `ft710-netaudio-recv` locally (config in `~/.config/FT-710_remote/netaudio/`) and
   `ft710-netaudio-send` on the rig host over ssh (config in `~/.config/ft710-netaudio/`).
   Nothing about your setup is hard-coded: the rig host is the ssh host from Settings, the
-  source is the **Source node** setting or, if blank, `RB_SOURCE` from the bridge's
-  `bridge.env`, and the destination is this computer's address as the rig host sees it
+  source is the **Source node** setting or, if blank, `RB_SOURCE` from `bridge.env` in the rig
+  config dir, and the destination is this computer's address as the rig host sees it
   (or the **Send to** setting).
 * The sender captures only that node (`node.dont-fallback`): if the radio's USB audio is
   missing it is not started (no fallback to another microphone), and it is restarted when the
@@ -205,18 +189,16 @@ How it works:
   down*. It then restarts the sender (every third try both ends) with 1 / 2 / 5 / 10 s backoff.
   The status line shows state, uptime and restart count.
 * **Listen** plays the stream on this computer's speakers via a `pw-loopback` with its own
-  volume (0–150 %); off by default. It never changes what WSJT-X/fldigi record.
-  With **direct TX** (no Mumble) the Mumble volume row is hidden and this RX network slider is
-  the speaker volume; switching to direct TX turns Listen on (switching back turns it off).
-  The status line says when Listen is off.
+  volume (0–150 %); on by default (it is the only local playback of the radio). It never
+  changes what WSJT-X/fldigi record. The status line says when Listen is off.
 
 **WSJT-X / fldigi**: choose **FT-710 RX (network)** as the audio input (WSJT-X: Settings →
 Audio → Input; fldigi: Configure → Sound Card → PulseAudio/PortAudio capture). It is a
-normal PipeWire/Pulse source (`ft710_rx_net`), mono 48 kHz. Transmit audio is unchanged.
+normal PipeWire/Pulse source (`ft710_rx_net`), mono 48 kHz.
 
-**RX gain** (slider in the RX network row, −6 to +20 dB = 0.5×–10×, default +9.5 dB = 3× like
-the Mumble bridge's RX gain; saved as `netaudio/rxGain`). It is applied on the desktop, in all
-modes, to what WSJT-X/fldigi, the level meter and the listen monitor get, and changes live
+**RX gain** (slider in the RX network row, −6 to +20 dB = 0.5×–10×, default +9.5 dB = 3×;
+saved as `netaudio/rxGain`). It is applied on the desktop to what WSJT-X/fldigi, the level
+meter and the listen monitor get, and changes live
 (no restart, no dropout). A lookahead limiter (3 ms lookahead, 150 ms release) holds peaks at
 −1 dBFS, so no slider position clips; double-click the value to reset it. The limiter is a
 small LADSPA plugin (`app/netaudio/ft710_rxlimit.c`) compiled into the app and run in a
@@ -247,7 +229,6 @@ Measured on a LAN (FT-710 USB audio, mono 48 kHz, rig host sender / desktop rece
 | RTP Opus 32 kbit/s | 25 kbit/s payload, ~42 kbit/s wire | 3–4.6 % | 0.4 % | VBR: SSB audio needs less than the target |
 | RTP Opus 48 kbit/s | 53 kbit/s payload, ~70 kbit/s wire | 3.2 % | 0.3 % | |
 | RTP Opus 64 kbit/s | 69 kbit/s payload, ~86 kbit/s wire | 3.4 % | 0.3 % | |
-| Mumble (for comparison) | ~72 kbit/s | bridge 6.6 %, murmur 1.3 % | client 1.2 % (143 MB) | |
 
 Opus is lossy; for digital modes on a LAN prefer L16. 32–48 kbit/s is plenty for SSB/FT8
 over a VPN.
@@ -264,11 +245,8 @@ cross-correlation over 2 s windows, ~5 min per mode; milliseconds):
 | ROC L16, 120 ms | 158 | 143 | 158 |
 | RTP Opus 48, 120 ms | 171 | 161 | 177 |
 | RTP Opus 32, 120 ms | 192 | 188 | 198 |
-| Mumble (packet arrival at the decoder) | 24 | 24 | 35 |
 
-The Mumble figure excludes the Mumble client's jitter buffer and audio output (typically another
-30–70 ms), so in practice it is comparable to RTP L16 / 40 ms or ROC / 60 ms. Lower buffers are
-fine on a quiet wired LAN; use 120 ms or more over Wi-Fi or a VPN.
+Lower buffers are fine on a quiet wired LAN; use 120 ms or more over Wi-Fi or a VPN.
 
 Optional unit files (`server/netaudio/ft710-netaudio-send.service`,
 `app/netaudio/ft710-netaudio-recv.service`): copy them to `~/.config/systemd/user/` if you
@@ -286,13 +264,13 @@ ft710-remote --netaudio watch 30    # monitor a running stream: level, unit stat
 ft710-remote --netaudio stop
 ```
 
-## Direct TX (Mumble-free)
+## TX gate
 
-`server/ft710-txgate/ft710_txgate.py` replaces Mumble + radio-bridge for transmit. The app holds
-one authenticated TCP control connection to it (HMAC challenge with a shared token, heartbeat
-every 100 ms) and, while PTT is held, sends the selected microphone as RTP over UDP on the same
-port (L16, or Opus at the stream's bitrate when compression is on). The gate is then the only
-thing that plays into the radio's USB audio input (`RB_SINK`) and the only thing that keys flrig.
+`server/ft710-txgate/ft710_txgate.py` is the transmit path. The app holds one authenticated
+TCP control connection to it (HMAC challenge with a shared token, heartbeat every 100 ms) and,
+while PTT is held, sends the selected microphone as RTP over UDP on the same port (L16, or Opus
+at the stream's bitrate when compression is on). The gate is the only thing that plays into the
+radio's USB audio input (`RB_SINK` / `TG_SINK`) and the only thing that keys flrig.
 
 ```
  desktop: ft710-remote ── TCP 10010 (auth, HB, PTT) ──▶ rig host: ft710-txgate ── flrig set_ptt
@@ -309,35 +287,32 @@ cp systemd/ft710-txgate.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-It reads `bridge.env` first (so `RB_SINK`, `RB_FLRIG_URL`, `RB_HANG_S` are shared) and uses the
-same `tx_enabled` and `tx_gain` files in `~/.config/radio-bridge/`. Needs Python 3, `pacat`
-and libopus (for Opus). Open TCP+UDP `TG_PORT` (default 10010) in the rig host's firewall for
-the allowed subnets. The token is created (mode 600) on first start; the app reads it over ssh
-and never stores it.
+It reads `bridge.env` in the rig config dir first (so `RB_SINK`, `RB_FLRIG_URL`, `RB_HANG_S` are
+shared) and uses `tx_enabled` and `tx_gain` from `~/.config/radio-bridge/`. Needs Python 3,
+`pacat` and libopus (for Opus). Open TCP+UDP `TG_PORT` (default 10010) in the rig host's
+firewall for the allowed subnets. The token is created (mode 600) on first start; the app reads
+it over ssh and never stores it.
 
-Client: **Settings → Network audio** → a LAN stream mode, **PTT / TX audio = Direct to the TX
-gate**, pick the **Microphone**, TX gate port and service. Then:
+Client: **Settings → Network audio / TX** → pick the **Microphone**, TX gate port and service. Then:
 
-* **Connect** checks flrig PTT is 0 and no keyed marker exists, stops `radio-bridge` (the units
-  conflict, so only one of them can ever drive the radio), starts `ft710-txgate`, reads the token
-  and connects. The "TX gate (direct TX)" row shows the link state; reconnects use 1/2/5/10 s
+* **Connect** checks flrig PTT is 0 and no keyed marker exists, starts `ft710-txgate`, reads the
+  token and connects. The "TX gate" status row shows the link state; reconnects use 1/2/5/10 s
   backoff and never re-key by themselves.
 * **PTT / Space** keys only when the link is ready and TX keying is enabled. The button shows
   TALKING when the gate reports the rig keyed; the RX/TX label comes from flrig. The "TX mic"
-  meter shows your level; the TX slider is applied in the gate.
+  meter shows your level; the TX level slider is applied in the gate.
   PTT is refused (and the meter says *not capturing — PTT blocked*) until the mic is actually
   capturing; the selected mic must exist (no silent fallback to another input) and pw-record
   errors are written to the log.
-* **Disconnect** (and quitting) unkeys, stops the gate and starts `radio-bridge` again — only if
-  flrig reports PTT 0 ("restore radio-bridge" in Settings). Switching back to Mumble mode always
-  restores the bridge.
+* **Disconnect** (and quitting) unkeys and stops the gate and the stream.
 
 Gate behaviour: key → 70 ms TX delay → fade in; on release drain, fade out, 0.7 s hang, unkey.
 It unkeys at once on control-connection loss, a heartbeat older than 500 ms, no mic audio within
 2 s of keying (`TG_FIRST_AUDIO_S`), a mid-over audio gap over 2 s (`TG_GAP_S`; silence is played
 during shorter gaps), the 120 s TX timeout (then PTT must be released first), `tx_enabled`
-removed, `radio-bridge` starting, or service stop; `ExecStopPost` unkeys after a crash (only if
-its own keyed marker exists). Settings: `server/ft710-txgate/txgate.env.example`.
+removed, or service stop; `ExecStopPost` unkeys after a crash (only if its own keyed marker
+exists). It also still refuses to key while a legacy `radio-bridge` unit is active.
+Settings: `server/ft710-txgate/txgate.env.example`.
 
 Tests (no radio, no real flrig, no sound card: a fake flrig XML-RPC server and a fake `pacat`
 or a PipeWire null sink):
@@ -346,24 +321,19 @@ or a PipeWire null sink):
 cd server/ft710-txgate
 python3 test_txgate.py [--null-sink]            # the gate: auth, allowlist, timeouts, gaps, failsafes
 python3 test_app_txgate.py ../../build/ft710-remote   # the real app (CLI + GUI PTT path) against the gate
-python3 test_app_scripts.py                     # the app's ssh start/stop scripts with temporary user units
-python3 ../../app/tests/test_ui_modes.py         # UI rows/sliders per audio + TX mode (offscreen, temp config)
+python3 test_app_scripts.py                     # the app's ssh start/stop scripts with a temporary user unit
+python3 ../../app/tests/test_ui_modes.py         # UI rows/sliders, old-settings migration (offscreen, temp config)
 ```
 
 ## Safety
 
-* The bridge keys the radio **only while `~/.config/radio-bridge/tx_enabled` exists**
-  on the rig host. Remove the file (or use the client's TX-enable control) to make the
-  system receive-only.
-* Hard **transmit timeout of 120 s** (`RB_TX_TIMEOUT_S`); the bridge unkeys and ends the
-  over. It also unkeys after `RB_HANG_S` of silence and if `tx_enabled` disappears.
-* If the bridge dies while keyed, the systemd unit's `ExecStopPost` unkeys via flrig
-  (only when the bridge's own `keyed` marker exists).
-* The TX gate (direct TX) keys only on an explicit PTT from the authenticated app, only while
-  `tx_enabled` exists and radio-bridge is stopped, with the same 120 s timeout and hang, and
-  unkeys by itself when heartbeats or audio stop (see [Direct TX](#direct-tx-mumble-free)).
-* The scope streamer and click-to-tune never key the transmitter; click-to-tune changes
-  only VFO-A frequency.
+* The TX gate keys the radio **only while `~/.config/radio-bridge/tx_enabled` exists**
+  on the rig host, and only on an explicit PTT from the authenticated app. Remove the file
+  (or use the client's "Disable TX keying" button) to make the system receive-only.
+* Hard **transmit timeout of 120 s**; the gate unkeys by itself when heartbeats or audio stop,
+  and `ExecStopPost` unkeys via flrig if it dies while keyed (see [TX gate](#tx-gate)).
+* The stream sender, the scope streamer and click-to-tune never key the transmitter;
+  click-to-tune changes only VFO-A frequency.
 * You are responsible for operating within your license and local regulations,
   including control-operator requirements for remote operation.
 
@@ -374,6 +344,6 @@ python3 ../../app/tests/test_ui_modes.py         # UI rows/sliders per audio + T
 * [ratmandu/YaesuWFTesting](https://github.com/ratmandu/YaesuWFTesting) – Yaesu
   SCU-LAN10 / FT4222 waterfall experiments.
 * VLSC – prior work on the Yaesu scope stream.
-* Mumble / pymumble, flrig.
+* flrig, PipeWire, roc-toolkit.
 
 Copyright 2026 Jim Howard. Licensed under the Apache License, Version 2.0; see [LICENSE](LICENSE).

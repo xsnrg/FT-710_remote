@@ -1,3 +1,0 @@
-pymumble==1.6.1
-opuslib==3.0.1
-protobuf==3.12.2

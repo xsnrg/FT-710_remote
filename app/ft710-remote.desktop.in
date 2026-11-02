@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=FT-710 Remote
-Comment=Remote audio, PTT and band scope for a Yaesu FT-710 via Mumble and flrig
+Comment=Remote audio, PTT and band scope for a Yaesu FT-710 via flrig and a LAN audio stream
 Exec=@CMAKE_INSTALL_FULL_BINDIR@/ft710-remote
 Icon=audio-input-microphone
 Terminal=false

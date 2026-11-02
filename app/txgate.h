@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// TX without Mumble (network audio mode): the app streams the selected microphone as RTP to the
+// TX: the app streams the selected microphone as RTP to the
 // ft710-txgate service on the rig host and drives PTT over the gate's authenticated TCP control
 // link. The gate is the only thing that keys flrig or plays into the radio; it unkeys on its own
 // when this link drops, heartbeats stop (~0.5 s) or audio stops (~0.2 s) while PTT is held.
@@ -12,8 +12,8 @@
 #include <QRandomGenerator>
 #include <opus/opus.h>
 
-// Prepare the rig host for direct TX (ssh, one round trip). Never stops radio-bridge unless flrig
-// reports PTT=0 and neither keyed marker exists. Prints key=value lines.
+// Prepare the rig host for TX (ssh, one round trip): start the gate unless it runs, only when flrig
+// reports PTT=0 and no keyed marker exists. Prints key=value lines.
 static const char *TXG_PREPARE = R"SH(
 rpc() { curl -s -m 2 -H 'Content-Type: text/xml' -d "<?xml version=\"1.0\"?><methodCall><methodName>$1</methodName></methodCall>" "$FLRIG" | tr -d '\n\t ' | sed -n 's/.*<value>\(<[a-z0-9]*>\)\{0,1\}\([^<]*\).*/\2/p'; }
 set -- $SSH_CONNECTION; echo "server=$3"
@@ -28,11 +28,7 @@ if ! systemctl --user cat "$UNIT" >/dev/null 2>&1; then echo result=notinstalled
 if [ "$(systemctl --user is-active "$UNIT")" != active ]; then
   P=$(rpc rig.get_ptt)
   if [ "$P" != 0 ]; then echo "result=busy flrig PTT=${P:-no answer}"; exit 0; fi
-  if [ -e "$HOME/.cache/radio-bridge/keyed" ] || [ -e "$HOME/.cache/ft710-txgate/keyed" ]; then echo "result=busy keyed marker present"; exit 0; fi
-  if [ "$(systemctl --user is-active "$BRIDGE")" = active ]; then
-    systemctl --user stop "$BRIDGE" || { echo "result=fail could not stop $BRIDGE"; exit 0; }
-    echo bridge_stopped=1
-  fi
+  if [ -e "$HOME/.cache/ft710-txgate/keyed" ]; then echo "result=busy keyed marker present"; exit 0; fi
   systemctl --user start "$UNIT" || { echo "result=fail could not start $UNIT"; exit 0; }
 fi
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$TOK" ] && break; sleep 0.1; done
@@ -41,21 +37,9 @@ echo "token=$(head -c 200 "$TOK")"
 echo result=ok
 )SH";
 
-// Stop the gate (it unkeys before exiting) and optionally start radio-bridge again, only when the
-// bridge is enabled, flrig reports PTT=0 and no keyed marker exists.
+// Stop the gate (it unkeys before exiting).
 static const char *TXG_STOP = R"SH(
-rpc() { curl -s -m 2 -H 'Content-Type: text/xml' -d "<?xml version=\"1.0\"?><methodCall><methodName>$1</methodName></methodCall>" "$FLRIG" | tr -d '\n\t ' | sed -n 's/.*<value>\(<[a-z0-9]*>\)\{0,1\}\([^<]*\).*/\2/p'; }
 systemctl --user stop "$UNIT" 2>/dev/null; echo "gate=$(systemctl --user is-active "$UNIT" 2>/dev/null)"
-if [ "$RESTORE" = 1 ]; then
-  if [ "$(systemctl --user is-enabled "$BRIDGE" 2>/dev/null)" != enabled ]; then echo bridge=not-enabled
-  elif [ "$(systemctl --user is-active "$BRIDGE")" = active ]; then echo bridge=active
-  else
-    P=$(rpc rig.get_ptt)
-    if [ "$P" = 0 ] && [ ! -e "$HOME/.cache/radio-bridge/keyed" ] && [ ! -e "$HOME/.cache/ft710-txgate/keyed" ]; then
-      systemctl --user start "$BRIDGE" && echo bridge=started || echo bridge=start-failed
-    else echo "bridge=not-started (flrig PTT=${P:-no answer} or keyed marker)"; fi
-  fi
-fi
 )SH";
 
 class TxLink : public QObject {
@@ -113,7 +97,7 @@ public:
         QString s = gateKeyed() ? "KEYED" : "ready";
         s += " · " + codec();
         if (gst.value("tx_enabled") == "0") s += " · TX keying off";
-        if (gst.value("bridge") == "1") s += " · radio-bridge active (gate blocked)";
+        if (gst.value("bridge") == "1") s += " · legacy radio-bridge active (gate blocked)";
         if (gst.value("safe") == "1") s += " · gate in safe mode";
         const QString l = gst.value("latched");
         if (!l.isEmpty() && l != "-") s += " · latched: " + QString(l).replace('_', ' ') + " (release PTT)";
@@ -121,7 +105,7 @@ public:
         return s;
     }
 
-    // Normal start: prepare the rig host over ssh (stops radio-bridge, starts the gate), then connect.
+    // Normal start: prepare the rig host over ssh (starts the gate), then connect.
     void start() {
         if (st != Off && st != Failed) return;
         direct = false; tries = 0; err.clear();
@@ -136,16 +120,15 @@ public:
         if (toneMode) tone.start(); else startMic();
         attempt();
     }
-    // Stop: release PTT, say BYE, stop capture. remote: also stop the gate (and restore the bridge if asked).
-    void stop(bool remote, bool restoreBridge, bool sync) {
+    // Stop: release PTT, say BYE, stop capture. remote: also stop the gate on the rig host.
+    void stop(bool remote, bool sync) {
         setPtt(false);
         if (sock.state() == QAbstractSocket::ConnectedState) { sendLine("BYE"); sock.flush(); sock.waitForBytesWritten(200); }
         setSt(Off);
         stopLocal();
         token.fill(0); token.clear();
         if (!remote || direct || !cfg.configured()) return;
-        const QString vars = QString("UNIT=%1\nBRIDGE=%2\nFLRIG=%3\nRESTORE=%4\n")
-            .arg(shq(naCfg.txUnit), shq(cfg.bridgeService), shq(cfg.flrigUrl()), restoreBridge ? "1" : "0");
+        const QString vars = QString("UNIT=%1\n").arg(shq(naCfg.txUnit));
         auto *p = new QProcess(this);
         p->start("ssh", sshArgs("bash -s"));
         p->write((vars + TXG_STOP).toUtf8()); p->closeWriteChannel();
@@ -216,7 +199,7 @@ private:
         setSt(Preparing);
         if (prep) { prep->disconnect(); prep->kill(); prep->deleteLater(); }
         prep = new QProcess(this);
-        const QString vars = QString("UNIT=%1\nBRIDGE=%2\nFLRIG=%3\n").arg(shq(naCfg.txUnit), shq(cfg.bridgeService), shq(cfg.flrigUrl()));
+        const QString vars = QString("UNIT=%1\nFLRIG=%2\n").arg(shq(naCfg.txUnit), shq(cfg.flrigUrl()));
         connect(prep, &QProcess::finished, this, [this](int code, QProcess::ExitStatus es) {
             const QString out = QString::fromUtf8(prep->readAllStandardOutput());
             prep->deleteLater(); prep = nullptr;
@@ -225,7 +208,6 @@ private:
             QMap<QString, QString> kv;
             for (const QString &l : out.split('\n')) { const int i = l.indexOf('='); if (i > 0) kv[l.left(i)] = l.mid(i + 1).trimmed(); }
             const QString r = kv.value("result");
-            if (kv.contains("bridge_stopped")) log("stopped radio-bridge (TX goes through the TX gate now)");
             if (r == "notinstalled") { failHard(QString("TX gate (%1) is not installed on %2 — see README").arg(naCfg.txUnit, cfg.rigName())); return; }
             if (r.startsWith("busy")) { fail("rig busy, not switching TX path: " + r.mid(5)); return; }
             if (r != "ok") { fail(r.isEmpty() ? "TX gate start failed" : r.mid(r.indexOf(' ') + 1)); return; }
