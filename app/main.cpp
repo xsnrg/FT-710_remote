@@ -8,6 +8,7 @@
 #include <memory>
 #include <cmath>
 #include "tune.h"
+#include "devname.h"
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -859,7 +860,7 @@ private:
     }
 
     // --- TX (TX gate) ---
-    TxLink *tx; QWidget *micRow; QProgressBar *micBar; QLabel *micDev, *txgLbl; QTimer micUi;
+    TxLink *tx; QWidget *micRow; QProgressBar *micBar; QLabel *micDev, *txgLbl; QTimer micUi; AudioNodeNames nodeNames;
     bool talkNet = false;          // the current over is keyed through the TX gate
     QString gateSvc;               // last polled state of the gate unit
     QString noteText; QElapsedTimer noteAge;
@@ -878,7 +879,8 @@ private:
         micBar->setToolTip(tx->micProblem());
     }
     void updateTxUi() {
-        micDev->setText(naCfg.micSource.isEmpty() ? "default input" : naCfg.micSource);
+        if (naCfg.micSource.isEmpty()) { micDev->setText("default input"); micDev->setToolTip("Default input (follows your desktop sound settings)"); }
+        else { micDev->setText(nodeNames.label(naCfg.micSource)); micDev->setToolTip("PipeWire source: " + naCfg.micSource); }
         if (tx->active()) micUi.start(); else { micUi.stop(); updateMicUi(); }
         if (tx->active()) colored(txgLbl, tx->statusText(), tx->gateKeyed() ? "#c00" : tx->ready() ? "green" : "#c60");
         else colored(txgLbl, "not connected (Connect starts it)" + (gateSvc.isEmpty() ? QString() : " · service " + gateSvc), "gray");

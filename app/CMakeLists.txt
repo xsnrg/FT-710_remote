@@ -7,7 +7,7 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 qt_standard_project_setup()
-qt_add_executable(ft710-remote main.cpp netaudio.h txgate.h tune.h)
+qt_add_executable(ft710-remote main.cpp netaudio.h txgate.h tune.h devname.h)
 # Network-audio templates (sender side from server/netaudio, receiver side from app/netaudio),
 # compiled in so the app can generate the configs it uploads / runs.
 set(NETAUDIO_FILES
@@ -42,6 +42,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ft710-remote.desktop DESTINATION ${CMA
 enable_testing()
 add_executable(test_tune_round tests/test_tune_round.cpp)
 add_test(NAME tune_round COMMAND test_tune_round)
+add_executable(test_devname tests/test_devname.cpp)
+target_link_libraries(test_devname PRIVATE Qt6::Core)
+add_test(NAME devname COMMAND test_devname)
 add_executable(test_rxlimit tests/test_rxlimit.c)
 target_link_libraries(test_rxlimit PRIVATE ${CMAKE_DL_LIBS} m)
 add_custom_target(rxlimit_so ALL DEPENDS ${RXLIMIT_SO})
