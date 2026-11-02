@@ -17,9 +17,7 @@ It has two halves:
 > Settings from a Mumble-era install still load: the old Mumble keys are ignored and dropped
 > on the next Settings → OK, and the old "Mumble" audio mode becomes ROC.
 
-![FT-710 Remote client showing the band scope and waterfall on 20 m](docs/screenshot.png)
-
-*(Screenshot from the Mumble-era version; the scope part is unchanged.)*
+![FT-710 Remote client on 20 m FT8 (14.074 MHz): band scope and waterfall, RX gain and snap controls, network audio (ROC, L16) and TX gate status](docs/screenshot.png)
 
 ## Features
 
