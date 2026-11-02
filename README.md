@@ -34,7 +34,13 @@ It has two halves:
   PSK tune directly to the click. **Snap to [0.5 kHz | 1 kHz]** (on, 0.5 kHz by default)
   then rounds the final dial frequency: an LSB click on 3.788678 → 3.790178 → **3.790000 MHz**;
   with Snap off it rounds to 10/100/500 Hz depending on the span. While hovering, the readout
-  shows `cursor … → dial … (LSB +1.5 kHz)` and an outline shows where the passband will land.
+  shows `cursor … → dial … (LSB +1.5 kHz)` and an outline shows exactly where the passband
+  stripe will land after the click (same snapped dial, same geometry: LSB dial−2700…dial−300,
+  USB mirrored), so putting the outline over a conversation and clicking centres it in the
+  passband. Note: in SSB the FT-710's scope is *not* centred on the dial – it is centred on
+  dial ∓ 1.5 kHz (the passband centre, reported in the scope frame's metadata). The client uses
+  that radio-reported centre for the frequency axis; older builds assumed dial-centred and drew
+  everything 1.5 kHz too high in LSB, so clicks on a signal landed ~1.5–2 kHz off.
   Settings: `scopeSnapKHz`, `scopeSnapStep` (500/1000), `scopeSsbOffset` (0–3000 Hz).
 * **Network audio (optional, receive only)** – instead of hearing the radio only through
   Mumble, the rig host streams the radio's receive audio straight to the desktop with

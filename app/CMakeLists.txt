@@ -51,3 +51,6 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
     add_test(NAME ui_modes COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ui_modes.py $<TARGET_FILE:ft710-remote>)
 endif()
+# hover preview == stripe after the click, preview centred on the cursor, axis uses the radio's scope centre
+add_test(NAME scope_preview COMMAND $<TARGET_FILE:ft710-remote> --scope-selftest)
+set_tests_properties(scope_preview PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;DISPLAY=;WAYLAND_DISPLAY=")

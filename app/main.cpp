@@ -363,9 +363,8 @@ protected:
         }
         // passband + VFO marker
         if (span > 0 && vfo > 0) {
-            auto [a, b] = passband();
-            const double x0 = xOf(vfo + a), x1 = xOf(vfo + b), xv = xOf(vfo);
-            p.fillRect(QRectF(qMin(x0, x1), area.top(), qMax(1.0, qAbs(x1 - x0)), area.height()), QColor(255, 255, 255, 38));
+            const double xv = xOf(vfo);
+            p.fillRect(passRect(vfo, area), QColor(255, 255, 255, 38));
             p.setPen(QPen(QColor(255, 80, 80), 1)); p.drawLine(QPointF(xv, area.top()), QPointF(xv, area.bottom()));
         }
         // axis
@@ -405,10 +404,9 @@ protected:
             // where a click would put the dial and the passband (outline), so the signal under the cursor sits inside it
             if (clickToTune && (!canTune || canTune())) {
                 const double d = dialForX(hoverX);
-                auto [a, b] = passband();
-                if (d > 0 && b > a) {
+                if (d > 0 && passband().second > passband().first) {   // exactly the stripe the rig will have after the click
                     p.setPen(QPen(QColor(255, 200, 80, 170), 1, Qt::DashLine)); p.setBrush(Qt::NoBrush);
-                    p.drawRect(QRectF(QPointF(xOf(d + a), area.top() + 1), QPointF(xOf(d + b), area.bottom() - 1)));
+                    p.drawRect(passRect(d, area));
                 }
                 if (d > 0) { p.setPen(QPen(QColor(255, 140, 60, 200), 1, Qt::DotLine)); p.drawLine(QPointF(xOf(d), area.top()), QPointF(xOf(d), area.bottom())); }
             }
@@ -426,7 +424,7 @@ protected:
         if (onTune && hz > 0) onTune(hz);
     }
 
-private:
+public:   // state + mapping are public for --scope-selftest
     QTcpSocket sock; QTimer retry, stale; QString host; quint16 port = 7355; bool running = false;
     QByteArray buf, spectrum; QImage wf; QString status = "connecting…";
     QElapsedTimer lastData;
@@ -451,20 +449,16 @@ private:
         for (double m : {1.0, 2.0, 5.0, 10.0}) if (m * p10 >= raw) return m * p10;
         return 10 * p10;
     }
-    // Approximate receive passband relative to the VFO (Hz), from the mode byte in the frame.
-    // 0 LSB 1 USB 2 CW-L 3 CW-U 4 AM 5 AM-N 6 FM 7 FM-N 8 DATA-L 9 DATA-U A DATA-FM B DATA-FM-N C RTTY-L D RTTY-U E PSK
-    std::pair<double, double> passband() const {
-        switch (mode) {
-            case 0: case 8: return {-2700, -300};
-            case 1: case 9: case 0xE: return {300, 2700};
-            case 2: case 3: case 0xC: case 0xD: return {-250, 250};
-            case 4: return {-3000, 3000};
-            case 5: return {-2000, 2000};
-            case 6: case 0xA: return {-6000, 6000};
-            case 7: case 0xB: return {-3000, 3000};
-            default: return {0, 0};
-        }
+    std::pair<double, double> passband() const { return passbandHz(mode); }
+public:
+    // The passband stripe for a given dial frequency — one code path for the grey stripe (dial = VFO)
+    // and the hover preview (dial = where a click would tune), so the preview is what you get.
+    QRectF passRect(double dial, const QRect &area) const {
+        auto [a, b] = passband();
+        const double x0 = xOf(dial + a), x1 = xOf(dial + b);
+        return QRectF(qMin(x0, x1), area.top(), qMax(1.0, qAbs(x1 - x0)), area.height());
     }
+    // (readData/frame are public so --scope-selftest can feed frames)
     void readData() {
         buf += sock.readAll();
         static const int H = 50;
@@ -479,7 +473,10 @@ private:
             const uchar flags = d[40];
             if (flags & 0x80) setStatus("radio scope not streaming (radio off, SCU-LAN10 OFF, or no USB permission on the rig host)");
             else if ((flags & 1) && nb > 0 && d[42] != lastSpanCode) { lastSpanCode = d[42]; if (onSpanCode) onSpanCode(d[42]); }
-            if (!(flags & 0x80) && (flags & 1) && nb > 0) frame(qint64(v), qint64(st), qint64(sp), d[41], flags & 2, buf.mid(hdr + ml, nb));
+            if (!(flags & 0x80) && (flags & 1) && nb > 0) {
+                const qint64 start = scopeStartHz(d + hdr, ml, qint64(v), qint64(sp), qint64(st), flags & 2);   // radio's real centre (SSB: dial ∓ 1.5 kHz)
+                frame(qint64(v), start, qint64(sp), d[41], flags & 2, buf.mid(hdr + ml, nb));
+            }
             buf.remove(0, total);
         }
     }
@@ -2034,13 +2031,65 @@ static int txgateCli(QApplication &app, const QStringList &args, int i) {
     return rc;
 }
 
+// --scope-selftest: drive a real ScopeWidget with synthetic frames that carry the radio's scope centre
+// (meta[140:144]) and synthetic mouse clicks. For LSB and USB, snap 0.5 kHz / 1 kHz / off, checks that
+// (1) the hover preview stripe before the click == the grey stripe after the rig tunes there (in Hz and,
+// with the scope re-centred, against the axis), (2) with snap off the preview is centred on the cursor,
+// (3) the axis uses the radio's centre (dial 3.821000 LSB -> centre 3.819500), not the dial.
+static int scopeSelfTest() {
+    int fails = 0, n = 0;
+    QTextStream o(stdout);
+    auto check = [&](bool ok, const QString &what) { ++n; if (!ok) ++fails; o << (ok ? "PASS " : "FAIL ") << what << "\n"; };
+    const qint64 span = 100000; const int W = 850;
+    auto feed = [&](ScopeWidget &w, qint64 dial, int mode) {   // a frame as the FT-710 sends it in centre mode
+        const qint64 centre = dial + tuneSide(mode) * 1500;    // measured: LSB centre = dial - 1500 (meta[130:132] = 1500); USB assumed mirrored
+        QByteArray meta(150, 0);
+        for (int k = 0; k < 4; ++k) meta[140 + k] = char((centre >> (24 - 8 * k)) & 0xff);
+        const qint64 st = scopeStartHz(reinterpret_cast<const uchar *>(meta.constData()), meta.size(), dial, span, dial - span / 2, false);
+        w.frame(dial, st, span, mode, false, QByteArray(W, char(30)));
+        return st;
+    };
+    auto hz = [&](const ScopeWidget &w, double x) { return w.freqAt(x); };
+    {   // axis: LSB dial 3.821000 -> scope centre 3.819500
+        ScopeWidget w; w.resize(W, 200);
+        const qint64 st = feed(w, 3821000, 0);
+        check(st == 3819500 - span / 2, QString("LSB axis start %1 (centre 3.819500, not the dial)").arg(st));
+        check(std::abs(hz(w, W / 2.0) - 3819500) < 1, "LSB scope middle pixel = 3.819500 MHz");
+    }
+    for (int mode : {0, 1, 8, 9}) for (int step : {500, 1000, 0}) for (double x : {101.3, 333.0, 425.0, 612.7, 777.0}) {
+        ScopeWidget w; w.resize(W, 200); w.snap = step > 0; w.snapStepHz = step > 0 ? step : 500; w.ssbOffsetHz = 1500;
+        double tuned = 0; w.onTune = [&](double h) { tuned = h; };
+        const qint64 dial0 = 3821000; feed(w, dial0, mode);
+        const QRect area = w.rect();
+        const double cursor = hz(w, x), preDial = w.dialForX(x);
+        const QRectF pre = w.passRect(preDial, area);
+        const double preLo = hz(w, pre.left()), preHi = hz(w, pre.right());
+        QMouseEvent pr(QEvent::MouseButtonPress, QPointF(x, 50), QPointF(x, 50), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent rl(QEvent::MouseButtonRelease, QPointF(x, 50), QPointF(x, 50), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&w, &pr); QCoreApplication::sendEvent(&w, &rl);
+        const QString tag = QString("%1 snap %2 x=%3 cursor %4 -> dial %5:").arg(tuneSideName(mode)).arg(step ? QString::number(step) : "off")
+                                .arg(x).arg(cursor / 1e6, 0, 'f', 4).arg(tuned / 1e6, 0, 'f', 4);
+        check(tuned == preDial, tag + " click tunes to the previewed dial");
+        feed(w, qint64(tuned), mode);   // rig is now there; scope re-centres
+        const QRectF post = w.passRect(w.vfo, area);
+        const double postLo = hz(w, post.left()), postHi = hz(w, post.right());
+        check(std::abs(postLo - preLo) < 1 && std::abs(postHi - preHi) < 1,
+              tag + QString(" preview %1-%2 == stripe after click %3-%4").arg(preLo, 0, 'f', 0).arg(preHi, 0, 'f', 0).arg(postLo, 0, 'f', 0).arg(postHi, 0, 'f', 0));
+        const double mid = (preLo + preHi) / 2, tol = step > 0 ? step / 2.0 + 1 : 51;   // no snap: 100 Hz step at 100 kHz span
+        check(std::abs(mid - cursor) <= tol, tag + QString(" preview centred on the cursor (off by %1 Hz, allowed %2)").arg(mid - cursor, 0, 'f', 0).arg(tol));
+    }
+    o << "\n" << (n - fails) << "/" << n << " passed\n";
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     {   // command-line-only modes work without a display
         bool cli = false;
-        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio") || !strcmp(argv[k], "--txgate-test") || !strcmp(argv[k], "--print-receiver-conf")) cli = true;
+        for (int k = 1; k < argc; ++k) if (!strcmp(argv[k], "--print-config") || !strcmp(argv[k], "--netaudio") || !strcmp(argv[k], "--txgate-test") || !strcmp(argv[k], "--print-receiver-conf") || !strcmp(argv[k], "--scope-selftest")) cli = true;
         if (cli && qEnvironmentVariableIsEmpty("DISPLAY") && qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) qputenv("QT_QPA_PLATFORM", "offscreen");
     }
     QApplication app(argc, argv);
+    if (app.arguments().contains("--scope-selftest")) return scopeSelfTest();   // no settings, no network, no rig
     app.setApplicationName("ft710-remote");
     app.setOrganizationName("FT-710_remote");
     app.setDesktopFileName("ft710-remote");

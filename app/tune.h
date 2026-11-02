@@ -1,6 +1,8 @@
 // Click-to-tune: scope click -> VFO dial frequency. Header-only so app/tests can test it on its own.
 #pragma once
 #include <cmath>
+#include <cstdint>
+#include <utility>
 
 // FT-710 mode byte (scope frame meta[60]; same codes as CAT MD):
 // 0 LSB 1 USB 2 CW-L 3 CW-U 4 AM 5 AM-N 6 FM 7 FM-N 8 DATA-L 9 DATA-U A DATA-FM B DATA-FM-N C RTTY-L D RTTY-U E PSK
@@ -34,4 +36,33 @@ inline double clickDialHz(double clickedHz, int mode, double offsetHz, double sp
     // round in whole Hz first, so float error on an exact half (3788499.9999999995) still rounds up
     const double r = std::floor(std::round(dial) / res + 0.5) * res;
     return r > 0 ? r : 0;
+}
+
+// Approximate receive passband relative to the dial (Hz) for a mode byte. Used for BOTH the grey stripe
+// at the current dial and the hover preview at the dial a click would tune to, so they are identical.
+// LSB/USB 300-2700 Hz: its middle is 1500 Hz from the dial = the default SSB click offset.
+inline std::pair<double, double> passbandHz(int mode) {
+    switch (mode) {
+        case 0: case 8: return {-2700, -300};
+        case 1: case 9: case 0xE: return {300, 2700};
+        case 2: case 3: case 0xC: case 0xD: return {-250, 250};
+        case 4: return {-3000, 3000};
+        case 5: return {-2000, 2000};
+        case 6: case 0xA: return {-6000, 6000};
+        case 7: case 0xB: return {-3000, 3000};
+        default: return {0, 0};
+    }
+}
+
+// Left edge of the scope (Hz). The FT-710 does NOT centre its scope on the dial in SSB: the frame's
+// parameter block carries the real centre at meta[140:144] (big-endian Hz), e.g. dial 3.821000 LSB ->
+// centre 3.819500 (meta[130:132] = 1500 = the offset). Assuming centre = dial drew every signal
+// 1.5 kHz too high. Use the radio's centre when present and sane (within 10 kHz of the dial);
+// otherwise (old/short meta, fixed mode) keep the start the streamer computed.
+inline int64_t scopeStartHz(const unsigned char *meta, int metaLen, int64_t vfo, int64_t span, int64_t hdrStart, bool fixed) {
+    if (fixed || !meta || metaLen < 144 || span <= 0 || vfo <= 0) return hdrStart;
+    const int64_t c = (int64_t(meta[140]) << 24) | (int64_t(meta[141]) << 16) | (int64_t(meta[142]) << 8) | meta[143];
+    if (c <= 0 || c - vfo > 10000 || vfo - c > 10000) return hdrStart;
+    const int64_t st = c - span / 2;
+    return st > 0 ? st : 0;
 }
