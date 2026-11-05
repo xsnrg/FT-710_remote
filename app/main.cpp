@@ -792,8 +792,15 @@ private:
     // While a set_vfo is in flight the target is only remembered (coalesced): the finished handler
     // sends one follow-up carrying the newest target, so a fast burst of keys or clicks converges
     // to its last frequency with at most one ssh call per round trip. Returns false if refused.
+    // The guard for every dial change (click, arrow key, coalesced re-send): RX only, never while
+    // talking, range only, and hz == the shown dial skips a pointless set_vfo. A static pure
+    // function so --tune-keys-selftest can pin it down (it is not security-relevant: tuneTo is the
+    // only writer, and set_vfo carries a frequency and nothing else).
+    static bool tuneAllowed(double hz, double curHz, bool rx, bool talking) {
+        return rx && !talking && hz >= kMinDialHz && hz <= kMaxDialHz && hz != curHz;
+    }
     bool tuneTo(double hz) {
-        if (!radioRx || talking || hz < kMinDialHz || hz > kMaxDialHz || hz == vfoHz) return false;
+        if (!tuneAllowed(hz, vfoHz, radioRx, talking)) return false;
         vfoHz = hz;
         vfoLbl->setText(QString::number(hz / 1e6, 'f', 6) + " MHz");
         tuneTargetHz = hz;
@@ -889,6 +896,12 @@ public:
         check(arrowsBlockedByFocus(&table), "item view focused: arrows navigate it");
         check(!arrowsBlockedByFocus(&box) && !arrowsBlockedByFocus(&button), "button/checkbox focused: still tunes");
         check(!arrowsBlockedByFocus(&plain), "plain widget (scope) focused: tune");
+        check(tuneAllowed(14079000, 14074000, true, false), "tune guard: RX, in range, new frequency: allowed");
+        check(!tuneAllowed(14079000, 14079000, true, false), "tune guard: hz equals the shown dial: no redundant set_vfo");
+        check(!tuneAllowed(14079000, 14074000, false, false), "tune guard: radio not receiving (flrig PTT=1): refused");
+        check(!tuneAllowed(14079000, 14074000, true, true), "tune guard: we are talking: refused");
+        check(!tuneAllowed(20000, 14074000, true, false) && !tuneAllowed(80e6, 14074000, true, false),
+              "tune guard: outside 30 kHz .. 75 MHz: refused");
         o << (fails ? QString("\n%1 of %2 FAILED\n").arg(fails).arg(n) : QString("\nall %1 passed\n").arg(n)) << Qt::flush;
         return fails ? 1 : 0;
     }
