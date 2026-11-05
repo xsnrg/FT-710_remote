@@ -1,7 +1,9 @@
 // Unit test for keyboard step tuning (tune.h): arrow-key deltas and clamping to the FT-710 range.
 // Built by CMake as test_step_round; run: ctest or ./test_step_round
 #include "../tune.h"
+#include <cmath>
 #include <cstdio>
+#include <limits>
 static int fails = 0;
 static void eq(const char *what, double got, double want) {
     const bool ok = std::fabs(got - want) < 0.5;
@@ -31,8 +33,8 @@ int main() {
     // unknown / invalid dial -> 0: the caller must refuse (the app shows the VFO the poll reported)
     eq("dial 0 (VFO unknown) -> 0", stepDialHz(0, keyStepHz(TuneKey::Right)), 0);
     eq("dial -1 -> 0", stepDialHz(-1, keyStepHz(TuneKey::Right)), 0);
-    eq("dial NaN -> 0", stepDialHz(0.0 / 0.0, keyStepHz(TuneKey::Right)), 0);
-    eq("dial inf -> 0", stepDialHz(1.0 / 0.0, keyStepHz(TuneKey::Right)), 0);
+    eq("dial NaN -> 0", stepDialHz(std::numeric_limits<double>::quiet_NaN(), keyStepHz(TuneKey::Right)), 0);
+    eq("dial inf -> 0", stepDialHz(std::numeric_limits<double>::infinity(), keyStepHz(TuneKey::Right)), 0);
     eq("delta 0 -> dial unchanged (caller sees no change and does nothing)", stepDialHz(14074000, 0), 14074000);
     std::printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
     return fails ? 1 : 0;

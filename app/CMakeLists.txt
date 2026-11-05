@@ -59,3 +59,6 @@ endif()
 # hover preview == stripe after the click, preview centred on the cursor, axis uses the radio's scope centre
 add_test(NAME scope_preview COMMAND $<TARGET_FILE:ft710-remote> --scope-selftest)
 set_tests_properties(scope_preview PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;DISPLAY=;WAYLAND_DISPLAY=")
+# arrow-key routing: key map, keypad modifier, focus rules (static logic, offscreen)
+add_test(NAME tune_keys COMMAND $<TARGET_FILE:ft710-remote> --tune-keys-selftest)
+set_tests_properties(tune_keys PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;DISPLAY=;WAYLAND_DISPLAY=")

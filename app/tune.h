@@ -54,6 +54,9 @@ inline std::pair<double, double> passbandHz(int mode) {
     }
 }
 
+// FT-710 tuning range (Hz): guards both stepDialHz() and the app's tuneTo().
+inline constexpr double kMinDialHz = 30e3, kMaxDialHz = 75e6;
+
 // Keyboard step tuning (Main's arrow keys): Left/Right coarse, Up/Down fine. The arrows move the
 // dial itself, so mode and passband do not matter (like the VFO-UP/DOWN keys on the radio).
 enum class TuneKey { None, Left, Right, Up, Down };
@@ -69,7 +72,7 @@ inline double keyStepHz(TuneKey k) {
 }
 // New dial frequency (whole Hz) at dialHz + deltaHz, clamped to the FT-710's tuning range;
 // 0 = the current dial is unknown/invalid, so the caller must refuse to tune.
-inline double stepDialHz(double dialHz, double deltaHz, double loHz = 30e3, double hiHz = 75e6) {
+inline double stepDialHz(double dialHz, double deltaHz, double loHz = kMinDialHz, double hiHz = kMaxDialHz) {
     if (!(dialHz > 0) || !std::isfinite(dialHz) || !(hiHz > loHz)) return 0;
     const double d = std::round(dialHz) + std::round(deltaHz);
     return d < loHz ? loHz : d > hiHz ? hiHz : d;
