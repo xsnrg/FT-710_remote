@@ -155,6 +155,10 @@ public:
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         setMouseTracking(true);
         setCursor(Qt::CrossCursor);
+        // Focusable without consuming any key itself: clicking the scope parks the keyboard focus
+        // here (a plain widget, so Main's arrow-key tuning accepts it), which gives the arrow keys
+        // a natural home after using the span box or another focus-taking control.
+        setFocusPolicy(Qt::StrongFocus);
         retry.setSingleShot(true); retry.setInterval(3000);
         QObject::connect(&retry, &QTimer::timeout, this, [this] { open(); });
         QObject::connect(&sock, &QTcpSocket::readyRead, this, [this] { readData(); });
@@ -570,7 +574,8 @@ public:
         pttLbl->setFont(big); vfoLbl->setFont(big);
         vfoLbl->setToolTip("Arrow keys step VFO-A through flrig (only while the radio is receiving): "
                            "Left/Right \u00b1 5 kHz, Up/Down \u00b1 500 Hz. The dial itself moves: mode does not matter, "
-                           "unlike a scope click. A widget that uses the arrows keeps them while it has focus.");
+                           "unlike a scope click. A slider, spin box or combo box (e.g. Span) keeps the arrows "
+                           "while it has the focus; click the scope to give them back to tuning.");
         g->addRow("TX keying:", txEnLbl);
         g->addRow("Radio PTT (flrig):", pttLbl);
         g->addRow("VFO:", vfoLbl);
@@ -633,6 +638,10 @@ public:
         connect(&holdTimer, &QTimer::timeout, this, [this] { beginTalk(); });
         timer.start();
         applyConfig();
+        // Start with the keyboard focus on the scope: the first focusable widget in tab order
+        // would otherwise be the scope's Span combo box, which then swallows Up/Down (span!) and
+        // Left/Right instead of tuning. Pending focus: applied when the window first shows.
+        scope->setFocus();
         // App restarted while the network stream kept running (Settings: keep running): just monitor it.
         if (cfg.configured() && NetAudio::localRunning()) na->start(true);
         if (!cfg.configured()) QTimer::singleShot(300, this, [this] { editSettings(); });
@@ -1408,8 +1417,9 @@ private:
               "the ft710-scope service on the rig host). The shaded band is the approximate passband, the red line "
               "the VFO. With \"Click to tune\" on, a single click sets VFO-A there via flrig (only while receiving). "
               "The arrow keys step the dial anywhere in the window: Left/Right \u00b1 5 kHz, Up/Down \u00b1 500 Hz "
-              "(also only while receiving; a widget that uses the arrows keeps them while it has focus, "
-              "buttons and checkboxes do not, so they tune even when one is focused). "
+              "(also only while receiving; a slider, spin box or combo box (e.g. Span) keeps the arrows while it "
+              "has the focus; click the scope to give them back to tuning; buttons and checkboxes do not take "
+              "the focus, so they never block it). "
               "**Span** and **Level** set the radio's own scope span (1 kHz-1 MHz) and scope level (-30 to +30 dB, 0.5 dB "
               "steps) through flrig (CAT SS05/SS04, display settings only). With \"Auto contrast\" off the colours are fixed, "
               "so Level works like the radio's knob; turn it on to let the app rescale colours itself. "

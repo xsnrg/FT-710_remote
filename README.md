@@ -52,8 +52,9 @@ It has two halves:
 * Status of flrig PTT, the VFO, `tx_enabled`, the stream and the TX gate polled over ssh.
 * **Keyboard tuning** – the arrow keys step VFO-A by 5 kHz (Left/Right) and 500 Hz (Up/Down)
   through flrig, only while the radio is receiving; the dial itself moves, so unlike a scope
-  click the mode does not matter. A widget that uses the arrows (slider, spin box, the log)
-  keeps them while it has focus.
+  click the mode does not matter. A widget that uses the arrows (slider, spin box, the span
+  combo, the log) keeps them while it has focus — the scope accepts focus too, so a click
+  there hands the arrows back to tuning.
 * Window size, volumes and scope settings remembered between runs.
 
 ## Architecture
