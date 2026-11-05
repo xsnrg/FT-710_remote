@@ -792,15 +792,16 @@ private:
     // While a set_vfo is in flight the target is only remembered (coalesced): the finished handler
     // sends one follow-up carrying the newest target, so a fast burst of keys or clicks converges
     // to its last frequency with at most one ssh call per round trip. Returns false if refused.
-    // The guard for every dial change (click, arrow key, coalesced re-send): RX only, never while
-    // talking, range only, and hz == the shown dial skips a pointless set_vfo. A static pure
-    // function so --tune-keys-selftest can pin it down (it is not security-relevant: tuneTo is the
-    // only writer, and set_vfo carries a frequency and nothing else).
-    static bool tuneAllowed(double hz, double curHz, bool rx, bool talking) {
-        return rx && !talking && hz >= kMinDialHz && hz <= kMaxDialHz && hz != curHz;
+    // The guard every set_vfo must pass at the moment it is sent (click, arrow key, and the
+    // coalesced re-send): RX only, never while keying (talking or the PTT hold window), range
+    // only, and hz == curHz skips a pointless set_vfo. A static pure function so
+    // --tune-keys-selftest can pin it down (it is not security-relevant: tuneTo/sendTune are the
+    // only writers, and set_vfo carries a frequency and nothing else).
+    static bool tuneAllowed(double hz, double curHz, bool rx, bool keying) {
+        return rx && !keying && hz >= kMinDialHz && hz <= kMaxDialHz && hz != curHz;
     }
     bool tuneTo(double hz) {
-        if (!tuneAllowed(hz, vfoHz, radioRx, talking)) return false;
+        if (!tuneAllowed(hz, vfoHz, radioRx, talking || holdTimer.isActive())) return false;
         vfoHz = hz;
         vfoLbl->setText(QString::number(hz / 1e6, 'f', 6) + " MHz");
         tuneTargetHz = hz;
@@ -813,10 +814,14 @@ private:
         connect(tuneProc, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
             const bool ok = st == QProcess::NormalExit && code == 0;
             tuneProc->deleteLater(); tuneProc = nullptr;
-            if (!ok) QTextStream(stderr) << "rig.set_vfo failed" << Qt::endl;
-            // A failed send leaves tuneTargetHz set: the authoritative poll below will restore
-            // the VFO the radio actually has.
-            if (ok && tuneTargetHz > 0 && tuneTargetHz != tuneSentHz) {
+            if (!ok) { QTextStream(stderr) << "rig.set_vfo failed" << Qt::endl; note("Frequency change failed"); }
+            // Send-time gate: re-check tuneAllowed now, not what was true when the target was
+            // queued — PTT (Space, button, or hold window ending) or flrig-reported TX may have
+            // started during the ssh round trip. Refused: the pending target drops and the
+            // authoritative poll below restores the VFO the radio actually has. (The hz != curHz
+            // term rides on tuneSentHz: a target already sent needs no re-send.)
+            if (ok && tuneTargetHz > 0 &&
+                tuneAllowed(tuneTargetHz, tuneSentHz, radioRx, talking || holdTimer.isActive())) {
                 sendTune(tuneTargetHz);   // coalesced follow-up for the newest target
                 return;
             }
@@ -1049,9 +1054,13 @@ private:
         if (!tx->micUp()) { ptt->setDown(false); note("Not keying — " + tx->micProblem()); return; }
         ptt->setStyleSheet("background:#e90; color:black;");
         ptt->setText("hold…");
+        // PTT wins over tuning: a target queued but not yet sent is dropped (nothing newer than
+        // what may already be in flight), so a key or click just before pressing PTT can never
+        // move the dial while keying. The next poll restores the real VFO under the label.
+        tuneTargetHz = tuneSentHz;
         holdTimer.start();
     }
-    void beginTalk() {
+    void beginTalk() {   // hold window over, keying for real: pressPtt() already dropped any queued tune target
         holdTimer.stop();
         if (talking) return;
         if (!tx->setPtt(true)) { resetPttButton(); note(tx->ready() && !tx->micUp() ? "Not keying — " + tx->micProblem() : QString("TX link not ready — not keyed")); return; }
