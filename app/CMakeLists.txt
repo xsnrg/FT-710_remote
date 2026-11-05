@@ -42,6 +42,8 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ft710-remote.desktop DESTINATION ${CMA
 enable_testing()
 add_executable(test_tune_round tests/test_tune_round.cpp)
 add_test(NAME tune_round COMMAND test_tune_round)
+add_executable(test_step_round tests/test_step_round.cpp)
+add_test(NAME step_round COMMAND test_step_round)
 add_executable(test_devname tests/test_devname.cpp)
 target_link_libraries(test_devname PRIVATE Qt6::Core)
 add_test(NAME devname COMMAND test_devname)

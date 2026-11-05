@@ -50,6 +50,10 @@ It has two halves:
   everything 1.5 kHz too high in LSB, so clicks on a signal landed ~1.5–2 kHz off.
   Settings: `scopeSnapKHz`, `scopeSnapStep` (500/1000), `scopeSsbOffset` (0–3000 Hz).
 * Status of flrig PTT, the VFO, `tx_enabled`, the stream and the TX gate polled over ssh.
+* **Keyboard tuning** – the arrow keys step VFO-A by 5 kHz (Left/Right) and 500 Hz (Up/Down)
+  through flrig, only while the radio is receiving; the dial itself moves, so unlike a scope
+  click the mode does not matter. A widget that uses the arrows (slider, spin box, the log)
+  keeps them while it has focus.
 * Window size, volumes and scope settings remembered between runs.
 
 ## Architecture

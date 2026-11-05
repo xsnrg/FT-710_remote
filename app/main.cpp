@@ -568,6 +568,9 @@ public:
         for (auto *l : {&txEnLbl, &pttLbl, &vfoLbl}) *l = new QLabel("…");
         QFont big = pttLbl->font(); big.setBold(true); big.setPointSize(big.pointSize() + 4);
         pttLbl->setFont(big); vfoLbl->setFont(big);
+        vfoLbl->setToolTip("Arrow keys step VFO-A through flrig (only while the radio is receiving): "
+                           "Left/Right \u00b1 5 kHz, Up/Down \u00b1 500 Hz. The dial itself moves: mode does not matter, "
+                           "unlike a scope click. Not swallowed when a slider, spin box, combo box or the log has focus.");
         g->addRow("TX keying:", txEnLbl);
         g->addRow("Radio PTT (flrig):", pttLbl);
         g->addRow("VFO:", vfoLbl);
@@ -654,6 +657,12 @@ protected:
                 }
                 return true;
             }
+            // Arrow-key tuning (repeat allowed: tuneTo's busy guard rate-limits the ssh steps).
+            if (e->type() == QEvent::KeyPress && k->modifiers() == Qt::NoModifier &&
+                isActiveWindow() && !QApplication::activeModalWidget() && arrowsForTuning()) {
+                const TuneKey key = arrowTuneKey(k->key());
+                if (key != TuneKey::None) { stepTune(key); return true; }
+            }
         } else if (e->type() == QEvent::MouseButtonRelease && (talking || holdTimer.isActive()) && !QApplication::activeModalWidget()) {
             // Release anywhere (even dragged off the button) ends TX.
             QTimer::singleShot(0, this, [this] { if (!ptt->isDown()) stopTalk(); });
@@ -691,6 +700,7 @@ private:
     QCheckBox *scopeChk, *scopeTuneChk, *scopeSnapChk; QWidget *scopeTuneOpts; QComboBox *scopeSnapStep; QSpinBox *scopeSsbOff;
     ScopeWidget *scope;
     bool radioRx = false;          // flrig last reported PTT=0 (tuning by click is only allowed then)
+    double vfoHz = 0;              // VFO the poll last reported (Hz; 0 = unknown) — the arrow keys step from this
     QProcess *tuneProc = nullptr;
     // scope span/level controls
     QWidget *scopeCtl; QComboBox *spanBox; QSlider *lvlSlider; QLabel *lvlLbl; QCheckBox *autoChk;
@@ -769,8 +779,9 @@ private:
         }
     }
     // Click-to-tune: flrig rig.set_vfo on the rig host (frequency only; never PTT, never menu/EX settings).
-    void tuneTo(double hz) {
-        if (tuneProc || !radioRx || talking || hz < 30e3 || hz > 75e6) return;
+    // Returns true if the change was started (false: busy, TX, out of range, or no radio RX).
+    bool tuneTo(double hz) {
+        if (tuneProc || !radioRx || talking || hz < 30e3 || hz > 75e6) return false;
         const QString body = QString("<?xml version=\"1.0\"?><methodCall><methodName>rig.set_vfo</methodName><params><param>"
                                      "<value><double>%1</double></value></param></params></methodCall>").arg(hz, 0, 'f', 0);
         tuneProc = new QProcess(this);
@@ -784,6 +795,37 @@ private:
         tuneProc->start("ssh", sshArgs("curl -s -m 3 -H 'Content-Type: text/xml' --data-binary @- " + shq(cfg.flrigUrl()) + " >/dev/null"));
         tuneProc->write(body.toUtf8()); tuneProc->closeWriteChannel();
         QTimer::singleShot(8000, tuneProc, [p = tuneProc] { if (p->state() != QProcess::NotRunning) p->kill(); });
+        return true;
+    }
+    // Arrow-key tuning: step the dial from the VFO the status poll last reported. Moves the dial
+    // itself (Left/Right ±5 kHz, Up/Down ±500 Hz), so — unlike a scope click — mode does not matter.
+    // The dial is advanced right away so held or repeated keys keep stepping while the ssh
+    // round-trip is in flight; the next poll confirms or corrects it.
+    void stepTune(TuneKey key) {
+        if (!cfg.configured() || talking || holdTimer.isActive() || vfoHz <= 0) return;
+        const double hz = stepDialHz(vfoHz, keyStepHz(key));
+        if (hz > 0 && hz != vfoHz && tuneTo(hz)) {
+            vfoHz = hz;
+            vfoLbl->setText(QString::number(hz / 1e6, 'f', 6) + " MHz");
+        }
+    }
+    // Left/Right coarse, Up/Down fine; any other key (or arrows with modifiers) is None.
+    static TuneKey arrowTuneKey(int key) {
+        switch (key) {
+            case Qt::Key_Left:  return TuneKey::Left;
+            case Qt::Key_Right: return TuneKey::Right;
+            case Qt::Key_Up:    return TuneKey::Up;
+            case Qt::Key_Down:  return TuneKey::Down;
+            default:            return TuneKey::None;
+        }
+    }
+    // The arrows tune unless a widget that uses them for editing or scrolling has focus
+    // (sliders, spin boxes, combo boxes, line edits, lists, the log): those keep their normal keys.
+    static bool arrowsForTuning() {
+        QWidget *w = QApplication::focusWidget();
+        return !w || (!qobject_cast<QAbstractSlider *>(w) && !qobject_cast<QAbstractSpinBox *>(w) &&
+                      !qobject_cast<QComboBox *>(w) && !qobject_cast<QLineEdit *>(w) &&
+                      !qobject_cast<QAbstractScrollArea *>(w) && !qobject_cast<QAbstractItemView *>(w));
     }
     QToolButton *logBtn; QPushButton *settingsBtn; QGroupBox *statusBox;
     QLabel *statusLbl, *txEnLbl, *pttLbl, *vfoLbl;
@@ -1277,6 +1319,8 @@ private:
               "**Band scope**: spectrum + waterfall from the FT-710 itself (MENU SCU-LAN10 = ON; streamed by "
               "the ft710-scope service on the rig host). The shaded band is the approximate passband, the red line "
               "the VFO. With \"Click to tune\" on, a single click sets VFO-A there via flrig (only while receiving). "
+              "The arrow keys step the dial anywhere in the window: Left/Right \u00b1 5 kHz, Up/Down \u00b1 500 Hz "
+              "(also only while receiving; a widget that uses the arrows keeps them while it has focus). "
               "**Span** and **Level** set the radio's own scope span (1 kHz-1 MHz) and scope level (-30 to +30 dB, 0.5 dB "
               "steps) through flrig (CAT SS05/SS04, display settings only). With \"Auto contrast\" off the colours are fixed, "
               "so Level works like the radio's knob; turn it on to let the app rescale colours itself. "
@@ -1315,7 +1359,7 @@ private:
     }
     void setOffline() {
         for (auto *l : {txEnLbl, pttLbl, vfoLbl}) colored(l, cfg.configured() ? cfg.rigName() + " unreachable" : "not configured (Settings…)", "gray");
-        txState = "unknown"; radioRx = false; setTxEnabled(false); updateUi();
+        txState = "unknown"; radioRx = false; vfoHz = 0; setTxEnabled(false); updateUi();
     }
     void parse(const QString &out) {
         QString logText;
@@ -1337,6 +1381,7 @@ private:
 
         bool okv; double hz = kv["vfo"].trimmed().toDouble(&okv);
         parseTx(kv["txgain"]);
+        vfoHz = okv && hz > 0 ? hz : 0;
         vfoLbl->setText(okv && hz > 0 ? QString::number(hz / 1e6, 'f', 6) + " MHz" : "?");
 
         if (log->isVisible() && li >= 0)
