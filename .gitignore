@@ -19,6 +19,8 @@ include/
 vendor/
 *.zip
 *.tgz
+# agent instructions (local, not part of the repo)
+AGENTS.md
 # local, station-specific settings and secrets
 *.env
 !*.env.example
